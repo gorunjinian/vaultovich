@@ -1,0 +1,37 @@
+# Gradle
+build/
+.gradle/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.swp
+*~
+
+# Kotlin
+*.class
+*.war
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# Environment / secrets
+local.properties
+*.env
+*.env.*
+
+# Logs
+*.log
+hs_err_pid*
+
+# Maven publish
+pom.xml.asc
+
+# Kotlin build metadata
+.kotlin/
