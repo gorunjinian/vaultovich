@@ -1,0 +1,10 @@
+# Shell scripts must stay LF so they run in Linux CI containers.
+# `gradlew` has no extension, so it needs its own rule.
+*.sh    text eol=lf
+gradlew text eol=lf
+
+# Batch files must stay CRLF.
+*.bat   text eol=crlf
+
+# Never normalise the wrapper jar.
+*.jar   binary

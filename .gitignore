@@ -35,3 +35,6 @@ pom.xml.asc
 
 # Kotlin build metadata
 .kotlin/
+
+# Gradle daemon JVM criteria (machine-specific, pins a vendor JDK)
+gradle/gradle-daemon-jvm.properties

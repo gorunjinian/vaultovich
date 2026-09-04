@@ -1,0 +1,12 @@
+Vaultovich
+Copyright 2026 gorunjinian
+
+This product includes software developed by ACINQ SAS.
+
+Vaultovich is a fork of bitcoin-kmp (https://github.com/ACINQ/bitcoin-kmp),
+Copyright 2014 ACINQ SAS, licensed under the Apache License, Version 2.0.
+
+The fork narrows the original Kotlin Multiplatform library to a single Kotlin/JVM
+target and adds support for BIP-322 message signing, BIP-352 silent payments,
+BIP-370 PSBT v2, BIP-374 DLEQ proofs and BIP-375 silent-payment PSBT fields,
+along with output descriptors and MuSig2 key aggregation.

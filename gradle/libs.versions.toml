@@ -1,0 +1,16 @@
+[versions]
+kotlin = "2.4.10"
+secp256k1 = "0.24.0"
+junit = "4.13.2"
+
+[libraries]
+# Multiplatform secp256k1 API. Resolves to secp256k1-kmp-jvm here; consumers supply
+# the matching JNI binding for their platform (see README).
+secp256k1 = { group = "fr.acinq.secp256k1", name = "secp256k1-kmp", version.ref = "secp256k1" }
+# JNI binding bundling the linux/darwin/mingw natives — test-time only.
+secp256k1-jni-jvm = { group = "fr.acinq.secp256k1", name = "secp256k1-kmp-jni-jvm", version.ref = "secp256k1" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+maven-publish = { id = "com.vanniktech.maven.publish", version = "0.34.0" }
