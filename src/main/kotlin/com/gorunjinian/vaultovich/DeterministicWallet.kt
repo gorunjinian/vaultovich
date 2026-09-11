@@ -182,7 +182,7 @@ object DeterministicWallet {
             @JvmStatic
             fun decode(input: String, parentPath: KeyPath = KeyPath.empty): Pair<Int, ExtendedPublicKey> {
                 val (prefix, bin) = Base58Check.decodeWithIntPrefix(input)
-                require(prefix == xpub || prefix == ypub || prefix == zpub || prefix == tpub || prefix == upub || prefix == vpub) { "invalid prefix" }
+                require(prefix in mainnetPublicPrefixes || prefix in testnetPublicPrefixes) { "invalid prefix" }
                 val bis = ByteArrayInput(bin)
                 val depth = bis.read()
                 val parent = Pack.int32BE(bis).toLong() and 0xffffffff
@@ -277,6 +277,35 @@ object DeterministicWallet {
     // p2wpkh testnet
     const val vprv: Int = 0x045f18bc
     const val vpub: Int = 0x045f1cf6
+
+    // SLIP-132 multisig prefixes (used by coordinators when exchanging cosigner keys)
+    // p2sh-of-p2wsh mainnet
+    const val Yprv: Int = 0x0295b005
+    const val Ypub: Int = 0x0295b43f
+
+    // p2wsh mainnet
+    const val Zprv: Int = 0x02aa7a99
+    const val Zpub: Int = 0x02aa7ed3
+
+    // p2sh-of-p2wsh testnet
+    const val Uprv: Int = 0x024285b5
+    const val Upub: Int = 0x024289ef
+
+    // p2wsh testnet
+    const val Vprv: Int = 0x02575048
+    const val Vpub: Int = 0x02575483
+
+    /** Every public version prefix that denotes a mainnet key. */
+    @JvmField
+    val mainnetPublicPrefixes: Set<Int> = setOf(xpub, ypub, zpub, Ypub, Zpub)
+
+    /** Every public version prefix that denotes a testnet / signet / regtest key. */
+    @JvmField
+    val testnetPublicPrefixes: Set<Int> = setOf(tpub, upub, vpub, Upub, Vpub)
+
+    /** Every private version prefix, mainnet and testnet. */
+    @JvmField
+    val privatePrefixes: Set<Int> = setOf(xprv, yprv, zprv, Yprv, Zprv, tprv, uprv, vprv, Uprv, Vprv)
 }
 
 data class KeyPath(@JvmField val path: List<Long>) {

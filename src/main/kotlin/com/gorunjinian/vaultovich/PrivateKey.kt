@@ -67,7 +67,8 @@ data class PrivateKey(@JvmField val value: ByteVector32) {
             return when (data.size) {
                 32 -> false
                 33 if data.last() == 1.toByte() -> true
-                else -> throw IllegalArgumentException("invalid private key ${Hex.encode(data)}")
+                // The message must not contain the key bytes: it may reach logs or crash reports.
+                else -> throw IllegalArgumentException("invalid private key length ${data.size}")
             }
         }
 

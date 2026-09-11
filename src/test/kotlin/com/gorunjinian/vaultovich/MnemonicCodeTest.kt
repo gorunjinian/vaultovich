@@ -66,4 +66,58 @@ class MnemonicCodeTest {
             assertTrue("expected '$mnemonic' to fail validation", threw)
         }
     }
+
+    @Test
+    fun wordCountMustBeOneOfTheBip39Sizes() {
+        // 9 words is a multiple of 3 but not a BIP-39 size (ENT would be 96 bits).
+        val nine = List(9) { "abandon" }
+        val e = runCatching { MnemonicCode.validate(nine) }.exceptionOrNull()
+        assertTrue("expected a word-count failure, got $e", e?.message?.contains("word count") == true)
+        // 12 bytes of entropy is likewise not a BIP-39 size.
+        assertTrue(runCatching { toMnemonics(ByteArray(12)) }.isFailure)
+        assertTrue(runCatching { toMnemonics(ByteArray(16)) }.isSuccess)
+    }
+
+    /**
+     * Official Japanese vectors (github.com/bip32JP/bip32JP.github.io, test_JP_BIP39.json). The words
+     * are separated by U+3000 and the passphrase contains characters (㍍, ゞ, ヴ) whose NFKD form
+     * differs from the typed form, so these fail unless both are normalised as BIP-39 requires.
+     */
+    @Test
+    fun bip39JapaneseVectorsRequireNfkd() {
+        val passphrase = "㍍ガバヴァぱばぐゞちぢ十人十色"
+        val vectors = listOf(
+            Pair(
+                "あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あおぞら",
+                "a262d6fb6122ecf45be09c50492b31f92e9beb7d9a845987a02cefda57a15f9c467a17872029a9e92299b5cbdf306e3a0ee620245cbd508959b6cb7ca637bd55",
+            ),
+            Pair(
+                "そつう　れきだい　ほんやく　わかす　りくつ　ばいか　ろせん　やちん　そつう　れきだい　ほんやく　わかめ",
+                "aee025cbe6ca256862f889e48110a6a382365142f7d16f2b9545285b3af64e542143a577e9c144e101a6bdca18f8d97ec3366ebf5b088b1c1af9bc31346e60d9",
+            ),
+        )
+        for ((sentence, expectedSeed) in vectors) {
+            assertEquals(expectedSeed, Hex.encode(toSeed(sentence, passphrase)))
+            assertEquals(expectedSeed, Hex.encode(toSeed(sentence.split("　"), passphrase)))
+        }
+    }
+
+    @Test
+    fun passphraseIsNfkdNormalised() {
+        val mnemonics = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        val composed = "café"       // e-acute, precomposed
+        val decomposed = "café"    // e + combining acute
+        assertTrue(toSeed(mnemonics, composed).contentEquals(toSeed(mnemonics, decomposed)))
+        // Compatibility characters decompose too: the full-width 'Ａ' is the ASCII 'A' under NFKD.
+        assertTrue(toSeed(mnemonics, "Ａ").contentEquals(toSeed(mnemonics, "A")))
+    }
+
+    @Test
+    fun sentenceWhitespaceIsTolerated() {
+        val words = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        val seed = toSeed(words, "")
+        assertTrue(toSeed("  $words ", "").contentEquals(seed))
+        assertTrue(toSeed(words.replace(" ", "　"), "").contentEquals(seed))
+        MnemonicCode.validate(words.replace(" ", "  "))
+    }
 }

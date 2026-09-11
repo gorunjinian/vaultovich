@@ -99,6 +99,8 @@ abstract class BtcSerializer<T> {
         @JvmStatic
         fun varint(input: Input): ULong {
             val first = input.read()
+            // `read()` reports end-of-stream as -1, which `toULong()` would turn into 2^64-1.
+            require(first >= 0) { "cannot read a varint from an empty stream" }
             return when {
                 first < 0xFD -> first.toULong()
                 first == 0xFD -> uint16(input).toULong()
@@ -133,12 +135,15 @@ abstract class BtcSerializer<T> {
         }
 
         @JvmStatic
-        fun bytes(input: Input, size: Long): ByteArray = bytes(input, size.toInt())
+        fun bytes(input: Input, size: Long): ByteArray {
+            require(size in 0..input.availableBytes.toLong()) { "cannot read $size bytes from a stream that has ${input.availableBytes} bytes left" }
+            return bytes(input, size.toInt())
+        }
 
         @JvmStatic
         fun bytes(input: Input, size: Int): ByteArray {
             // NB: we make that check before allocating a byte array, otherwise an attacker can exhaust our heap space.
-            require(size <= input.availableBytes) { "cannot read $size bytes from a stream that has ${input.availableBytes} bytes left" }
+            require(size in 0..input.availableBytes) { "cannot read $size bytes from a stream that has ${input.availableBytes} bytes left" }
             val blob = ByteArray(size)
             if (size > 0) {
                 input.read(blob, 0, size)
@@ -161,6 +166,7 @@ abstract class BtcSerializer<T> {
         @JvmStatic
         fun script(input: Input): ByteArray {
             val length = varint(input) // read size
+            require(length <= input.availableBytes.toULong()) { "cannot read $length bytes from a stream that has ${input.availableBytes} bytes left" }
             return bytes(input, length.toInt()) // read bytes
         }
 
@@ -188,7 +194,11 @@ abstract class BtcSerializer<T> {
             maxElement: Int?,
             protocolVersion: Long
         ): List<T> {
-            val count = varint(input).toInt()
+            val declared = varint(input)
+            // Every element occupies at least one byte, so a count above the remaining bytes is bogus
+            // (and, unchecked, would loop on a truncated stream or wrap when narrowed to Int).
+            require(declared <= input.availableBytes.toULong()) { "invalid length" }
+            val count = declared.toInt()
             if (maxElement != null) require(count <= maxElement) { "invalid length" }
             val items = mutableListOf<T>()
             repeat(count) {

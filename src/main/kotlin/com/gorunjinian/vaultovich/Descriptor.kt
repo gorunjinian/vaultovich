@@ -40,9 +40,12 @@ object Descriptor {
         var c = 1L
         var cls = 0
         var clscount = 0
-        span.forEach { ch ->
+        span.forEachIndexed { i, ch ->
             val pos = INPUT_CHARSET.indexOf(ch)
-            if (pos == -1) return ""
+            // Fail loudly: returning "" here used to let callers emit "desc#" with an empty checksum,
+            // which the importing wallet rejects without saying why. The character itself is not
+            // echoed because the descriptor may contain a private key.
+            require(pos != -1) { "descriptor contains an invalid character at position $i" }
             c = polyMod(c, pos and 31) // Emit a symbol for the position inside the group, for every character.
             cls = cls * 3 + (pos shr 5) // Accumulate the group numbers
             clscount += 1
@@ -66,26 +69,62 @@ object Descriptor {
         return ret.toString()
     }
 
-    private fun getBIP84KeyPath(chainHash: BlockHash): Pair<String, Int> = when (chainHash) {
-        Block.Testnet4GenesisBlock.hash, Block.Testnet3GenesisBlock.hash, Block.RegtestGenesisBlock.hash -> "84'/1'/0'/0" to DeterministicWallet.tpub
-        Block.LivenetGenesisBlock.hash -> "84'/0'/0'/0" to DeterministicWallet.xpub
+    /** BIP-380: the key origin fingerprint is exactly 8 lowercase hex characters. */
+    @JvmStatic
+    fun formatFingerprint(fingerprint: Long): String = (fingerprint and 0xFFFFFFFFL).toString(16).padStart(8, '0')
+
+    /**
+     * Re-encode an extended public key as the `xpub` / `tpub` form descriptors require (BIP-380
+     * only defines those two). Accepts every SLIP-132 variant (`ypub`, `zpub`, `Ypub`, `Zpub` and
+     * the testnet `u`/`v`/`U`/`V` forms), which is what coordinators hand out; the network is taken
+     * from the prefix. Private keys are refused: a signing device never exports them.
+     */
+    @JvmStatic
+    fun normalizeExtendedPublicKey(extendedKey: String): String {
+        val prefix = runCatching { Base58Check.decodeWithIntPrefix(extendedKey).first }
+            .getOrElse { throw IllegalArgumentException("not a valid extended key") }
+        require(prefix !in DeterministicWallet.privatePrefixes) { "private extended keys must not be used in descriptors" }
+        val target = when (prefix) {
+            in DeterministicWallet.mainnetPublicPrefixes -> DeterministicWallet.xpub
+            in DeterministicWallet.testnetPublicPrefixes -> DeterministicWallet.tpub
+            else -> throw IllegalArgumentException("unknown extended key prefix")
+        }
+        val (_, key) = DeterministicWallet.ExtendedPublicKey.decode(extendedKey)
+        return DeterministicWallet.encode(key, target)
+    }
+
+    /** BIP-84 account path and the xpub prefix for the chain. */
+    private fun getBIP84Account(chainHash: BlockHash): Pair<String, Int> = when (chainHash) {
+        Block.Testnet4GenesisBlock.hash, Block.Testnet3GenesisBlock.hash, Block.RegtestGenesisBlock.hash, Block.SignetGenesisBlock.hash -> "84'/1'/0'" to DeterministicWallet.tpub
+        Block.LivenetGenesisBlock.hash -> "84'/0'/0'" to DeterministicWallet.xpub
         else -> error("invalid chain hash $chainHash")
     }
 
+    /**
+     * The BIP-84 receive and change descriptors for the first account of [master]: `wpkh()` of the
+     * key origin `[fp/84'/c'/0']`, the account xpub, and the `/0/` (receive) or `/1/` (change) branch
+     * followed by the wildcard child, both with checksums.
+     */
     @Suppress("FunctionName")
     @JvmStatic
     fun BIP84Descriptors(chainHash: BlockHash, master: DeterministicWallet.ExtendedPrivateKey): Pair<String, String> {
-        val (keyPath, _) = getBIP84KeyPath(chainHash)
-        val accountPub = publicKey(derivePrivateKey(master, KeyPath(keyPath)))
-        val fingerprint = DeterministicWallet.fingerprint(master) and 0xFFFFFFFFL
-        return BIP84Descriptors(chainHash, fingerprint, accountPub)
+        val (accountPath, _) = getBIP84Account(chainHash)
+        val accountPub = publicKey(derivePrivateKey(master, KeyPath(accountPath)))
+        return BIP84Descriptors(chainHash, DeterministicWallet.fingerprint(master), accountPub)
     }
+
+    /**
+     * @param fingerprint master key fingerprint.
+     * @param accountPub the *account-level* public key, i.e. the key at `m/84'/c'/0'`. (Earlier
+     * versions derived one level deeper, which described addresses no BIP-84 wallet generates.)
+     */
     @Suppress("FunctionName")
     @JvmStatic
     fun BIP84Descriptors(chainHash: BlockHash, fingerprint: Long, accountPub: DeterministicWallet.ExtendedPublicKey): Pair<String, String> {
-        val (keyPath, prefix) = getBIP84KeyPath(chainHash)
-        val accountDesc = "wpkh([${fingerprint.toString(16)}/$keyPath]${DeterministicWallet.encode(accountPub, prefix)}/0/*)"
-        val changeDesc = "wpkh([${fingerprint.toString(16)}/$keyPath]${DeterministicWallet.encode(accountPub, prefix)}/1/*)"
+        val (accountPath, prefix) = getBIP84Account(chainHash)
+        val key = "[${formatFingerprint(fingerprint)}/$accountPath]${DeterministicWallet.encode(accountPub, prefix)}"
+        val accountDesc = "wpkh($key/0/*)"
+        val changeDesc = "wpkh($key/1/*)"
         return Pair(
             "$accountDesc#${checksum(accountDesc)}",
             "$changeDesc#${checksum(changeDesc)}"

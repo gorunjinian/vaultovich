@@ -38,12 +38,13 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
      *
      * @param priv private key used to sign the input.
      * @param outPoint input that should be signed.
+     * @param policy what the signer is willing to sign; defaults to the strict [SignPolicy.Default].
      * @return the psbt with a partial signature added (other inputs will not be modified).
      */
-    fun sign(priv: PrivateKey, outPoint: OutPoint): Either<UpdateFailure, SignPsbtResult> {
+    fun sign(priv: PrivateKey, outPoint: OutPoint, policy: SignPolicy = SignPolicy.Default): Either<UpdateFailure, SignPsbtResult> {
         val inputIndex = global.tx.txIn.indexOfFirst { it.outPoint == outPoint }
         if (inputIndex < 0) return Either.Left(UpdateFailure.InvalidInput("psbt transaction does not spend the provided outpoint"))
-        return sign(priv, inputIndex)
+        return sign(priv, inputIndex, policy)
     }
 
     /**
@@ -53,27 +54,39 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
      *
      * @param priv private key used to sign the input.
      * @param inputIndex index of the input that should be signed.
+     * @param policy what the signer is willing to sign; defaults to the strict [SignPolicy.Default].
      * @return the psbt with a partial signature added (other inputs will not be modified).
      */
-    fun sign(priv: PrivateKey, inputIndex: Int): Either<UpdateFailure, SignPsbtResult> {
+    fun sign(priv: PrivateKey, inputIndex: Int, policy: SignPolicy = SignPolicy.Default): Either<UpdateFailure, SignPsbtResult> {
         if (inputIndex >= inputs.size) return Either.Left(UpdateFailure.InvalidInput("input index must exist in the input tx"))
         val input = inputs[inputIndex]
-        return sign(priv, inputIndex, input, global).map { SignPsbtResult(this.copy(inputs = inputs.updated(inputIndex, it.first)), it.second) }
+        return sign(priv, inputIndex, input, global, policy).map { SignPsbtResult(this.copy(inputs = inputs.updated(inputIndex, it.first)), it.second) }
     }
 
-    private fun sign(priv: PrivateKey, inputIndex: Int, input: Input, global: Global): Either<UpdateFailure, Pair<Input, ByteVector>> {
+    private fun sign(priv: PrivateKey, inputIndex: Int, input: Input, global: Global, policy: SignPolicy): Either<UpdateFailure, Pair<Input, ByteVector>> {
         val txIn = global.tx.txIn[inputIndex]
         return when (input) {
             is Input.PartiallySignedInputWithoutUtxo -> Either.Left(UpdateFailure.CannotSignInput(inputIndex, "cannot sign: input hasn't been updated with utxo data"))
             is Input.WitnessInput.PartiallySignedWitnessInput -> {
-                if (input.nonWitnessUtxo != null && input.nonWitnessUtxo.txid != txIn.outPoint.txid) {
-                    Either.Left(UpdateFailure.InvalidNonWitnessUtxo("non-witness utxo does not match unsigned tx input"))
-                } else if (input.nonWitnessUtxo != null && input.nonWitnessUtxo.txOut.size <= txIn.outPoint.index) {
-                    Either.Left(UpdateFailure.InvalidNonWitnessUtxo("non-witness utxo index out of bounds"))
-                } else if (!Script.isNativeWitnessScript(input.txOut.publicKeyScript) && !Script.isPayToScript(input.txOut.publicKeyScript.toByteArray())) {
-                    Either.Left(UpdateFailure.InvalidWitnessUtxo("witness utxo must use native segwit or P2SH embedded segwit"))
-                } else {
-                    signWitness(priv, inputIndex, input, global)
+                val nonWitnessUtxo = input.nonWitnessUtxo
+                val isTaproot = runCatching { Script.isPay2tr(input.txOut.publicKeyScript) }.getOrDefault(false)
+                when {
+                    nonWitnessUtxo != null && nonWitnessUtxo.txid != txIn.outPoint.txid ->
+                        Either.Left(UpdateFailure.InvalidNonWitnessUtxo("non-witness utxo does not match unsigned tx input"))
+                    nonWitnessUtxo != null && nonWitnessUtxo.txOut.size <= txIn.outPoint.index ->
+                        Either.Left(UpdateFailure.InvalidNonWitnessUtxo("non-witness utxo index out of bounds"))
+                    // BIP-174: "the Signer must verify that the witness UTXO matches the output referenced
+                    // by the non-witness UTXO". The reader checks this, but Input constructors and
+                    // combine() are public, so re-check here where it actually matters.
+                    nonWitnessUtxo != null && nonWitnessUtxo.txOut[txIn.outPoint.index.toInt()] != input.txOut ->
+                        Either.Left(UpdateFailure.InvalidNonWitnessUtxo("non-witness utxo output does not match witness utxo"))
+                    // The BIP-143 fee attack: without the previous transaction, the amounts of the
+                    // other inputs are unverifiable. Taproot commits to all input amounts (BIP-341).
+                    nonWitnessUtxo == null && !isTaproot && !policy.trustWitnessUtxo ->
+                        Either.Left(UpdateFailure.MissingNonWitnessUtxo(inputIndex))
+                    !Script.isNativeWitnessScript(input.txOut.publicKeyScript) && !Script.isPayToScript(input.txOut.publicKeyScript.toByteArray()) ->
+                        Either.Left(UpdateFailure.InvalidWitnessUtxo("witness utxo must use native segwit or P2SH embedded segwit"))
+                    else -> signWitness(priv, inputIndex, input, global, policy)
                 }
             }
             is Input.NonWitnessInput.PartiallySignedNonWitnessInput -> {
@@ -82,7 +95,7 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
                 } else if (input.inputTx.txOut.size <= txIn.outPoint.index) {
                     Either.Left(UpdateFailure.InvalidNonWitnessUtxo("non-witness utxo index out of bounds"))
                 } else {
-                    signNonWitness(priv, inputIndex, input, global)
+                    signNonWitness(priv, inputIndex, input, global, policy)
                 }
             }
             is Input.FinalizedInputWithoutUtxo -> Either.Left(UpdateFailure.CannotSignInput(inputIndex, "cannot sign: input has already been finalized"))
@@ -92,11 +105,20 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
         }
     }
 
-    private fun signNonWitness(priv: PrivateKey, inputIndex: Int, input: Input.NonWitnessInput.PartiallySignedNonWitnessInput, global: Global): Either<UpdateFailure, Pair<Input.NonWitnessInput.PartiallySignedNonWitnessInput, ByteVector>> {
+    /**
+     * Resolve and vet the sighash type for an input: it must be defined for the script type
+     * ([isDefined]), allowed by the [policy], and not the SIGHASH_SINGLE-without-output case.
+     */
+    private fun checkSighashType(inputIndex: Int, sighashType: Int, isDefined: (Int) -> Boolean, policy: SignPolicy): UpdateFailure? = when {
+        !isDefined(sighashType) -> UpdateFailure.UnsupportedSighashType(inputIndex, sighashType)
+        sighashType !in policy.allowedSighashTypes -> UpdateFailure.SighashTypeNotAllowed(inputIndex, sighashType)
+        SigHash.isHashSingle(sighashType) && inputIndex >= global.tx.txOut.size -> UpdateFailure.SighashSingleWithoutMatchingOutput(inputIndex)
+        else -> null
+    }
+
+    private fun signNonWitness(priv: PrivateKey, inputIndex: Int, input: Input.NonWitnessInput.PartiallySignedNonWitnessInput, global: Global, policy: SignPolicy): Either<UpdateFailure, Pair<Input.NonWitnessInput.PartiallySignedNonWitnessInput, ByteVector>> {
         val sighashType = input.sighashType ?: SigHash.SIGHASH_ALL
-        if (!SigHash.isValidEcdsa(sighashType)) {
-            return Either.Left(UpdateFailure.UnsupportedSighashType(inputIndex, sighashType))
-        }
+        checkSighashType(inputIndex, sighashType, SigHash::isValidEcdsa, policy)?.let { return Either.Left(it) }
         val txIn = global.tx.txIn[inputIndex]
         val redeemScript = when (input.redeemScript) {
             null -> runCatching {
@@ -114,11 +136,22 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
                 }
             }
         }
+        if (!scriptReferencesKey(redeemScript, priv.publicKey())) return Either.Left(UpdateFailure.KeyDoesNotMatchInput(inputIndex))
         val sig = ByteVector(Transaction.signInput(global.tx, inputIndex, redeemScript, sighashType, input.amount, SigVersion.SIGVERSION_BASE, priv))
         return Either.Right(Pair(input.copy(partialSigs = input.partialSigs + (priv.publicKey() to sig)), sig))
     }
 
-    private fun signWitness(priv: PrivateKey, inputIndex: Int, input: Input.WitnessInput.PartiallySignedWitnessInput, global: Global): Either<UpdateFailure, Pair<Input.WitnessInput.PartiallySignedWitnessInput, ByteVector>> {
+    /**
+     * Whether [script] can be satisfied by [pub]: it pushes the key itself (P2PK, multisig) or its
+     * HASH160 (P2PKH script code, P2WPKH program). Only a necessary condition, but it costs nothing
+     * and stops a host from collecting signatures for keys the input cannot use.
+     */
+    private fun scriptReferencesKey(script: List<ScriptElt>, pub: PublicKey): Boolean {
+        val hash = ByteVector(pub.hash160())
+        return script.any { it is OP_PUSHDATA && (it.data == pub.value || it.data == hash) }
+    }
+
+    private fun signWitness(priv: PrivateKey, inputIndex: Int, input: Input.WitnessInput.PartiallySignedWitnessInput, global: Global, policy: SignPolicy): Either<UpdateFailure, Pair<Input.WitnessInput.PartiallySignedWitnessInput, ByteVector>> {
         val pubkeyScript = runCatching {
             Script.parse(input.txOut.publicKeyScript)
         }.getOrElse {
@@ -126,20 +159,25 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
         }
         // Taproot carries its own, different allow-list (0x00 is valid there and invalid here), so
         // it is checked inside its own branch below.
+        val ecdsaSighashType = input.sighashType ?: SigHash.SIGHASH_ALL
         if (!Script.isPay2tr(pubkeyScript)) {
-            val ecdsaSighashType = input.sighashType ?: SigHash.SIGHASH_ALL
-            if (!SigHash.isValidEcdsa(ecdsaSighashType)) {
-                return Either.Left(UpdateFailure.UnsupportedSighashType(inputIndex, ecdsaSighashType))
-            }
+            checkSighashType(inputIndex, ecdsaSighashType, SigHash::isValidEcdsa, policy)?.let { return Either.Left(it) }
         }
         // BIP-143 P2WPKH script code is `OP_DUP OP_HASH160 <pubKeyHash> OP_EQUALVERIFY OP_CHECKSIG`
         // (i.e. pay2pkh of the pubkey hash from the witness program). PSBT does NOT carry a
         // witnessScript for P2WPKH, so we derive the signing script inline rather than relying on
         // the caller to splice one in temporarily.
         fun signP2wpkh(program: List<ScriptElt>): Either<UpdateFailure, Pair<Input.WitnessInput.PartiallySignedWitnessInput, ByteVector>> {
+            if (!scriptReferencesKey(program, priv.publicKey())) return Either.Left(UpdateFailure.KeyDoesNotMatchInput(inputIndex))
             val pubkeyHash = (program[1] as OP_PUSHDATA).data.toByteArray()
             val signingScript = Script.pay2pkh(pubkeyHash)
-            val sig = ByteVector(Transaction.signInput(global.tx, inputIndex, signingScript, input.sighashType ?: SigHash.SIGHASH_ALL, input.amount, SigVersion.SIGVERSION_WITNESS_V0, priv))
+            val sig = ByteVector(Transaction.signInput(global.tx, inputIndex, signingScript, ecdsaSighashType, input.amount, SigVersion.SIGVERSION_WITNESS_V0, priv))
+            return Either.Right(Pair(input.copy(partialSigs = input.partialSigs + (priv.publicKey() to sig)), sig))
+        }
+
+        fun signWitnessScript(witnessScript: List<ScriptElt>): Either<UpdateFailure, Pair<Input.WitnessInput.PartiallySignedWitnessInput, ByteVector>> {
+            if (!scriptReferencesKey(witnessScript, priv.publicKey())) return Either.Left(UpdateFailure.KeyDoesNotMatchInput(inputIndex))
+            val sig = ByteVector(Transaction.signInput(global.tx, inputIndex, witnessScript, ecdsaSighashType, input.amount, SigVersion.SIGVERSION_WITNESS_V0, priv))
             return Either.Right(Pair(input.copy(partialSigs = input.partialSigs + (priv.publicKey() to sig)), sig))
         }
 
@@ -148,10 +186,7 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
             Script.isPay2wsh(pubkeyScript) -> when {
                 input.witnessScript == null -> Either.Left(UpdateFailure.InvalidWitnessUtxo("missing witness script"))
                 pubkeyScript != Script.pay2wsh(input.witnessScript) -> Either.Left(UpdateFailure.InvalidWitnessUtxo("witness script does not match redeemScript or scriptPubKey"))
-                else -> {
-                    val sig = ByteVector(Transaction.signInput(global.tx, inputIndex, input.witnessScript, input.sighashType ?: SigHash.SIGHASH_ALL, input.amount, SigVersion.SIGVERSION_WITNESS_V0, priv))
-                    Either.Right(Pair(input.copy(partialSigs = input.partialSigs + (priv.publicKey() to sig)), sig))
-                }
+                else -> signWitnessScript(input.witnessScript)
             }
             Script.isPay2tr(pubkeyScript) -> {
                 // BIP-86 key-path signing. `signInputTaprootKeyPath` below always applies the
@@ -165,13 +200,13 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
                 val signingKey = XonlyPublicKey(priv.publicKey())
                 val expectedOutputKey = signingKey.outputKey(Crypto.TaprootTweak.NoScriptTweak).first
                 val actualOutputKey = Script.pay2trOutputKey(pubkeyScript)
+                // Guard before `hashForSigningSchnorr`, whose own `require` accepts any negative
+                // value (a PSBT declaring 0xFFFFFFFF parses to -1) and would then mask it into
+                // SIGHASH_SINGLE | SIGHASH_ANYONECANPAY, and which *throws* for values like 0x41
+                // (or SIGHASH_SINGLE past the last output) instead of returning a failure.
+                val sighashFailure = checkSighashType(inputIndex, sighashType, SigHash::isValidTaproot, policy)
                 when {
-                    // Guard before `hashForSigningSchnorr`, whose own `require` accepts any negative
-                    // value (a PSBT declaring 0xFFFFFFFF parses to -1) and would then mask it into
-                    // SIGHASH_SINGLE | SIGHASH_ANYONECANPAY, and which *throws* for values like 0x41
-                    // instead of returning a failure — aborting the whole signing session.
-                    !SigHash.isValidTaproot(sighashType) ->
-                        Either.Left(UpdateFailure.UnsupportedSighashType(inputIndex, sighashType))
+                    sighashFailure != null -> Either.Left(sighashFailure)
                     actualOutputKey == null ->
                         Either.Left(UpdateFailure.InvalidWitnessUtxo("could not read the taproot output key"))
                     actualOutputKey != expectedOutputKey ->
@@ -201,18 +236,14 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
                 Script.isPay2wsh(input.redeemScript) -> when {
                     input.witnessScript == null -> Either.Left(UpdateFailure.InvalidWitnessUtxo("missing witness script"))
                     input.redeemScript != Script.pay2wsh(input.witnessScript) -> Either.Left(UpdateFailure.InvalidWitnessUtxo("witness script does not match redeemScript or scriptPubKey"))
-                    else -> {
-                        val sig = ByteVector(Transaction.signInput(global.tx, inputIndex, input.witnessScript, input.sighashType ?: SigHash.SIGHASH_ALL, input.amount, SigVersion.SIGVERSION_WITNESS_V0, priv))
-                        Either.Right(Pair(input.copy(partialSigs = input.partialSigs + (priv.publicKey() to sig)), sig))
-                    }
+                    else -> signWitnessScript(input.witnessScript)
                 }
                 else -> Either.Left(UpdateFailure.InvalidWitnessUtxo("redeem script is not a supported segwit witness program"))
             }
-            else -> {
-                val script = input.witnessScript ?: input.redeemScript ?: pubkeyScript
-                val sig = ByteVector(Transaction.signInput(global.tx, inputIndex, script, input.sighashType ?: SigHash.SIGHASH_ALL, input.amount, SigVersion.SIGVERSION_WITNESS_V0, priv))
-                Either.Right(Pair(input.copy(partialSigs = input.partialSigs + (priv.publicKey() to sig)), sig))
-            }
+            // Any other witness program (v1 with a non-32-byte program, v2..v16) has no defined
+            // signing semantics today. Signing it with BIP-143 over a caller-supplied script would
+            // produce a meaningless signature, so refuse.
+            else -> Either.Left(UpdateFailure.CannotSignInput(inputIndex, "unsupported witness program"))
         }
     }
 
@@ -482,9 +513,17 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
         @JvmStatic
         fun read(input: ByteArray): Either<ParseFailure, Psbt> = read(ByteArrayInput(input))
 
+        /**
+         * Parse a PSBT. Never throws on malformed input: the bytes come from an untrusted host, so
+         * anything the reader does not handle explicitly is reported as [ParseFailure.InvalidContent].
+         */
         @JvmStatic
         fun read(input: com.gorunjinian.vaultovich.io.Input): Either<ParseFailure, Psbt> =
-            PsbtReader.read(input)
+            try {
+                PsbtReader.read(input)
+            } catch (_: Exception) {
+                Either.Left(ParseFailure.InvalidContent)
+            }
     }
 
 }

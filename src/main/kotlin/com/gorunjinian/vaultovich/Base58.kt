@@ -192,9 +192,12 @@ object Base58Check {
     @JvmStatic
     fun decode(encoded: String): Pair<Byte, ByteArray> {
         val raw = Base58.decode(encoded)
+        // Never put `encoded` in a message: it may be a WIF or an xprv with one mistyped character,
+        // and exception messages end up in logs and crash reports.
+        require(raw.size >= 5) { "invalid Base58Check data: too short" }
         val versionAndHash = raw.dropLast(4).toByteArray()
         val checksum = raw.takeLast(4).toByteArray()
-        require(checksum.contentEquals(checksum(versionAndHash))) { "invalid Base58Check data $encoded" }
+        require(checksum.contentEquals(checksum(versionAndHash))) { "invalid Base58Check data: checksum mismatch" }
         return Pair(versionAndHash[0], versionAndHash.drop(1).toByteArray())
     }
 
@@ -223,9 +226,10 @@ object Base58Check {
     @JvmStatic
     fun decodeWithPrefixLen(encoded: String, prefixLen: Int): Pair<ByteArray, ByteArray> {
         val raw = Base58.decode(encoded)
+        require(raw.size >= 4 + prefixLen) { "invalid Base58Check data: too short" }
         val versionAndHash = raw.dropLast(4).toByteArray()
         val checksum = raw.takeLast(4).toByteArray()
-        require(checksum.contentEquals(checksum(versionAndHash))) { "invalid Base58Check data $encoded" }
+        require(checksum.contentEquals(checksum(versionAndHash))) { "invalid Base58Check data: checksum mismatch" }
         return Pair(versionAndHash.take(prefixLen).toByteArray(), versionAndHash.drop(prefixLen).toByteArray())
     }
 }

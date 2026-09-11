@@ -38,10 +38,13 @@ data class TaprootBip32DerivationPath(@JvmField val leaves: List<ByteVector32>, 
     }
 
     companion object {
+        /** BIP-371 `PSBT_IN/OUT_TAP_BIP32_DERIVATION` value. Throws [IllegalArgumentException] on malformed input. */
         fun read(bin: ByteArray): TaprootBip32DerivationPath {
             val input = ByteArrayInput(bin)
-            val numLeaves = BtcSerializer.varint(input).toInt()
-            val leaves = (0 until numLeaves).map { BtcSerializer.bytes(input, 32).byteVector32() }
+            val numLeaves = BtcSerializer.varint(input)
+            require(numLeaves <= (input.availableBytes / 32).toULong()) { "taproot derivation declares more leaf hashes than bytes" }
+            val leaves = (0 until numLeaves.toInt()).map { BtcSerializer.bytes(input, 32).byteVector32() }
+            require(input.availableBytes >= 4 && input.availableBytes % 4 == 0) { "taproot derivation must end with a fingerprint and whole child indices" }
             // The fingerprint is an unsigned 32-bit value; `toUInt()` before widening keeps
             // fingerprints with the high bit set from sign-extending into a negative Long, which
             // would never compare equal to the wallet's own fingerprint.
@@ -328,8 +331,34 @@ sealed class UpdateFailure {
     data class CannotUpdateOutput(val index: Int, val reason: String) : UpdateFailure()
     data class CannotSignInput(val index: Int, val reason: String) : UpdateFailure()
 
-    /** A taproot input declared a sighash type BIP-341 does not allow. */
+    /** An input declared a sighash type that is not defined for its script type (BIP-143 / BIP-341). */
     data class UnsupportedSighashType(val index: Int, val sighashType: Int) : UpdateFailure()
+
+    /** The effective sighash type is well-defined but not in [SignPolicy.allowedSighashTypes]. */
+    data class SighashTypeNotAllowed(val index: Int, val sighashType: Int) : UpdateFailure()
+
+    /**
+     * `SIGHASH_SINGLE` was requested for an input whose index has no matching output. For legacy
+     * inputs Bitcoin Core's `SignatureHash` returns the constant `1` in that case (the "SIGHASH_SINGLE
+     * bug"), so the resulting signature commits to nothing about the transaction and can be replayed
+     * against any other legacy UTXO of the same key. We refuse for every script type.
+     */
+    data class SighashSingleWithoutMatchingOutput(val index: Int) : UpdateFailure()
+
+    /**
+     * A non-taproot segwit input carries `PSBT_IN_WITNESS_UTXO` only. BIP-143 signatures commit only
+     * to the amount of the input being signed, so without `PSBT_IN_NON_WITNESS_UTXO` the amounts of
+     * the *other* inputs (and therefore the fee shown to the user) cannot be verified. See
+     * [SignPolicy.trustWitnessUtxo].
+     */
+    data class MissingNonWitnessUtxo(val index: Int) : UpdateFailure()
+
+    /**
+     * The script being signed (scriptPubKey, redeem script or witness script) references neither the
+     * signing key nor its HASH160. The signature would be useless, and a host asking for it is either
+     * buggy or harvesting signatures from keys unrelated to the input.
+     */
+    data class KeyDoesNotMatchInput(val index: Int) : UpdateFailure()
 
     /**
      * A taproot output commits to a script tree, so the BIP-86 (no-script) key-path signature we
@@ -348,6 +377,51 @@ sealed class UpdateFailure {
 }
 
 data class SignPsbtResult(val psbt: Psbt, val sig: ByteVector)
+
+/**
+ * What the BIP-174 signer role is willing to sign. The defaults are the strict settings used by
+ * hardware signers (Trezor, Ledger, Coldcard, BDK): every relaxation must be an explicit decision of
+ * the host, ideally one the user has been shown.
+ *
+ * @param trustWitnessUtxo when `false` (default), a non-taproot segwit input is only signed if
+ * `PSBT_IN_NON_WITNESS_UTXO` is present, its txid matches the outpoint being spent and the referenced
+ * output equals `PSBT_IN_WITNESS_UTXO`. A BIP-143 signature commits only to the amount of the input
+ * being signed, so a creator that supplies `witness_utxo` alone can misstate the amounts of the other
+ * inputs; across two signing rounds it can then splice one valid signature from each into a
+ * transaction that pays the difference as fee (CVE-2020-14199). BIP-174: "The Signer may choose to
+ * fail to sign a segwit input if a non-witness UTXO is not provided." Taproot inputs are exempt
+ * because a BIP-341 signature under SIGHASH_DEFAULT/ALL commits to every input amount (`sha_amounts`).
+ * @param allowedSighashTypes sighash types the signer may produce. The effective type is
+ * `PSBT_IN_SIGHASH_TYPE`, defaulting to SIGHASH_ALL for ECDSA inputs and SIGHASH_DEFAULT for taproot.
+ * Anything outside this set fails with [UpdateFailure.SighashTypeNotAllowed]. SIGHASH_NONE lets the
+ * creator rewrite every output after signing, SIGHASH_SINGLE leaves the other outputs modifiable, and
+ * ANYONECANPAY drops the commitment to the other inputs (on taproot: to their amounts as well).
+ */
+data class SignPolicy(
+    val trustWitnessUtxo: Boolean = false,
+    val allowedSighashTypes: Set<Int> = setOf(SigHash.SIGHASH_DEFAULT, SigHash.SIGHASH_ALL),
+) {
+    companion object {
+        /** Strict defaults: previous transaction required for segwit v0, SIGHASH_ALL / SIGHASH_DEFAULT only. */
+        @JvmField
+        val Default: SignPolicy = SignPolicy()
+
+        /**
+         * Every sighash type BIP-143 and BIP-341 define, and no previous-transaction requirement.
+         * Only for callers that display the consequences to the user, or for tests.
+         */
+        @JvmField
+        val Permissive: SignPolicy = SignPolicy(
+            trustWitnessUtxo = true,
+            allowedSighashTypes = setOf(
+                SigHash.SIGHASH_DEFAULT, SigHash.SIGHASH_ALL, SigHash.SIGHASH_NONE, SigHash.SIGHASH_SINGLE,
+                SigHash.SIGHASH_ANYONECANPAY or SigHash.SIGHASH_ALL,
+                SigHash.SIGHASH_ANYONECANPAY or SigHash.SIGHASH_NONE,
+                SigHash.SIGHASH_ANYONECANPAY or SigHash.SIGHASH_SINGLE,
+            ),
+        )
+    }
+}
 
 sealed class ParseFailure {
     object InvalidMagicBytes : ParseFailure()

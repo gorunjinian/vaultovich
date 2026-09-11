@@ -3,11 +3,35 @@
 package com.gorunjinian.vaultovich
 
 import com.gorunjinian.vaultovich.crypto.Pbkdf2
+import java.text.Normalizer
 import kotlin.jvm.JvmStatic
 
 object MnemonicCode {
     val englishWordlist: List<String>
         get() = BIP39_ENGLISH_WORDLIST
+
+    /** BIP-39: ENT is 128..256 bits in 32-bit steps, i.e. 12, 15, 18, 21 or 24 words. */
+    @JvmField
+    val VALID_WORD_COUNTS: Set<Int> = setOf(12, 15, 18, 21, 24)
+
+    /** BIP-39: entropy is 16..32 bytes in 4-byte steps. */
+    @JvmField
+    val VALID_ENTROPY_SIZES: Set<Int> = setOf(16, 20, 24, 28, 32)
+
+    private val WHITESPACE = Regex("\\s+")
+
+    /**
+     * BIP-39 mandates Unicode NFKD for the mnemonic sentence, the wordlist and the passphrase. Among
+     * other things this maps the ideographic space (U+3000) used by the Japanese wordlist to U+0020
+     * and decomposes precomposed accented characters, so that every wallet derives the same seed
+     * from the same visible text.
+     */
+    @JvmStatic
+    fun normalize(input: String): String = Normalizer.normalize(input, Normalizer.Form.NFKD)
+
+    /** Split a mnemonic sentence into words: NFKD first, then on any run of whitespace. */
+    private fun splitSentence(sentence: String): List<String> =
+        normalize(sentence).trim().split(WHITESPACE).filter { it.isNotEmpty() }
 
     private fun toBinary(x: Byte): List<Boolean> {
         tailrec fun loop(x: Int, acc: List<Boolean> = listOf()): List<Boolean> =
@@ -39,9 +63,10 @@ object MnemonicCode {
     fun validate(mnemonics: List<String>, wordlist: List<String> = englishWordlist) {
         require(wordlist.size == 2048) { "invalid word list (size should be 2048)" }
         require(mnemonics.isNotEmpty()) { "mnemonic code cannot be empty" }
-        require(mnemonics.size % 3 == 0) { "invalid mnemonic word count " + mnemonics.size + ", it must be a multiple of 3" }
+        require(mnemonics.size in VALID_WORD_COUNTS) { "invalid mnemonic word count ${mnemonics.size}, it must be one of $VALID_WORD_COUNTS" }
         val wordMap = wordlist.mapIndexed { index, s -> s to index }.toMap()
-        mnemonics.forEach { word -> require(wordMap.contains(word)) { "invalid mnemonic word $word" } }
+        // Report the position, never the word: a mnemonic word is a fragment of the seed.
+        mnemonics.forEachIndexed { i, word -> require(wordMap.contains(word)) { "invalid mnemonic word at position ${i + 1}" } }
         val indexes = mnemonics.map { word -> wordMap.getValue(word) }
 
         tailrec fun toBits(index: Int, acc: List<Boolean> = listOf()): List<Boolean> =
@@ -57,7 +82,7 @@ object MnemonicCode {
     }
 
     @JvmStatic
-    fun validate(mnemonics: String): Unit = validate(mnemonics.split(" "))
+    fun validate(mnemonics: String): Unit = validate(splitSentence(mnemonics))
 
     /**
      * BIP39 entropy encoding
@@ -69,6 +94,7 @@ object MnemonicCode {
     @JvmStatic
     fun toMnemonics(entropy: ByteArray, wordlist: List<String>): List<String> {
         require(wordlist.size == 2048) { "invalid word list (size should be 2048)" }
+        require(entropy.size in VALID_ENTROPY_SIZES) { "invalid entropy size ${entropy.size}, it must be one of $VALID_ENTROPY_SIZES bytes" }
         val digits = toBinary(entropy) + toBinary(Crypto.sha256(entropy)).take(entropy.size / 4)
 
         return group(digits, 11).map(MnemonicCode::fromBinary).map { wordlist[it] }
@@ -78,19 +104,23 @@ object MnemonicCode {
     fun toMnemonics(entropy: ByteArray): List<String> = toMnemonics(entropy, englishWordlist)
 
     /**
-     * BIP39 seed derivation
+     * BIP39 seed derivation: PBKDF2-HMAC-SHA512, 2048 rounds, password = the NFKD mnemonic sentence,
+     * salt = "mnemonic" + NFKD passphrase, both UTF-8.
+     *
+     * NB: this does not validate the mnemonic; call [validate] first when the words come from a user.
      *
      * @param mnemonics  mnemonic words
-     * @param passphrase passphrase
-     * @return a seed derived from the mnemonic words and passphrase
+     * @param passphrase passphrase (any Unicode; normalised here)
+     * @return a 64-byte seed derived from the mnemonic words and passphrase
      */
     @JvmStatic
     fun toSeed(mnemonics: List<String>, passphrase: String): ByteArray {
-        val password = mnemonics.joinToString(" ").encodeToByteArray()
-        val salt = ("mnemonic$passphrase").encodeToByteArray()
+        val password = normalize(mnemonics.joinToString(" ")).encodeToByteArray()
+        val salt = normalize("mnemonic$passphrase").encodeToByteArray()
         return Pbkdf2.withHmacSha512(password, salt, 2048, 64)
     }
 
+    /** See [toSeed]. The sentence may use any whitespace separator, including U+3000. */
     @JvmStatic
-    fun toSeed(mnemonics: String, passphrase: String): ByteArray = toSeed(mnemonics.split(" "), passphrase)
+    fun toSeed(mnemonics: String, passphrase: String): ByteArray = toSeed(splitSentence(mnemonics), passphrase)
 }

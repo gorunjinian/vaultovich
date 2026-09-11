@@ -50,9 +50,21 @@ val master = DeterministicWallet.generate(seed)
 val account = DeterministicWallet.derivePrivateKey(master, KeyPath("m/84'/0'/0'"))
 val address = Bitcoin.computeP2WpkhAddress(account.publicKey, Block.LivenetGenesisBlock.hash)
 
-// Sign a PSBT
+// Sign a PSBT. By default the signer refuses a segwit v0 input that lacks
+// PSBT_IN_NON_WITNESS_UTXO (the BIP-143 fee attack) and any sighash type other than
+// SIGHASH_ALL / SIGHASH_DEFAULT. Relax that only deliberately, via SignPolicy.
 val psbt = Psbt.read(psbtBytes).right!!
 val signed = psbt.sign(privateKey, inputIndex).right!!.psbt
+val relaxed = psbt.sign(privateKey, inputIndex, SignPolicy(trustWitnessUtxo = true))
+
+// Decide which outputs are ours (change) before showing a transaction. The script is rebuilt
+// from the account xpub the device holds; a host-supplied fingerprint or path proves nothing.
+val ours = SingleSigAccount(masterFingerprint, KeyPath("m/84'/0'/0'"), accountXpub, ScriptType.P2WPKH)
+when (val o = psbt.verifyOutput(outputIndex, ours)) {
+    is OutputOwnership.Ours -> if (o.isChange) hide() else showAsOurs()
+    OutputOwnership.External -> showPayment()
+    is OutputOwnership.Mismatch -> showPaymentAndWarn(o.reason)
+}
 ```
 
 ## Building

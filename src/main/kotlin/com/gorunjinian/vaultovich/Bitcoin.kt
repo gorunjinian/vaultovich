@@ -156,6 +156,8 @@ object Bitcoin {
     fun addressToPublicKeyScript(chainHash: BlockHash, address: String): Either<BitcoinError, List<ScriptElt>> {
         return runCatching { Base58Check.decode(address) }.fold(
             onSuccess = {
+                // P2PKH / P2SH payloads are HASH160s; Script.pay2pkh would throw on any other length.
+                if (it.second.size != 20) return@fold Either.Left(BitcoinError.InvalidAddress)
                 when (it.first) {
                     Base58.Prefix.PubkeyAddressTestnet if (chainHash == Block.Testnet4GenesisBlock.hash || chainHash == Block.Testnet3GenesisBlock.hash || chainHash == Block.RegtestGenesisBlock.hash || chainHash == Block.SignetGenesisBlock.hash) ->
                         Either.Right(Script.pay2pkh(it.second))

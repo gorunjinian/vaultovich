@@ -296,11 +296,13 @@ data class Transaction(
 
     val hasWitness: Boolean get() = txIn.any { it.hasWitness }
 
-    @JvmField
-    val hash: TxHash = TxHash(Crypto.hash256(write(this, SERIALIZE_TRANSACTION_NO_WITNESS)))
+    /**
+     * Computed on first use. Every `copy()` (updateWitness, updateSigScript, ...) produces a new
+     * instance; hashing eagerly made parsing a transaction with n inputs cost n full serialisations.
+     */
+    val hash: TxHash by lazy { TxHash(Crypto.hash256(write(this, SERIALIZE_TRANSACTION_NO_WITNESS))) }
 
-    @JvmField
-    val txid: TxId = TxId(hash)
+    val txid: TxId get() = TxId(hash)
 
     /**
      * @param i         index of the tx input to update
@@ -775,9 +777,8 @@ data class Transaction(
             if ((flags and 1) != 0 && serializeTxWitness(protocolVersion)) {
                 /* The witness flag is present, and we support witnesses. */
                 flags = flags xor 1
-                val witnesses = mutableListOf<ScriptWitness>()
-                for (i in 0..tx.txIn.lastIndex) witnesses += ScriptWitness.read(input, protocolVersion)
-                tx = tx.updateWitnesses(witnesses.toList())
+                // Read every witness into a single new input list rather than one copy() per input.
+                tx = tx.copy(txIn = tx.txIn.map { txIn -> txIn.copy(witness = ScriptWitness.read(input, protocolVersion)) })
                 require(tx.hasWitness) { "Superfluous witness record" }
             }
             require(flags == 0) { "Unknown transaction optional data" }

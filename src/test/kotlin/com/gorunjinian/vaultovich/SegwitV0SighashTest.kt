@@ -46,7 +46,9 @@ class SegwitV0SighashTest {
     private fun assertSignsAndVerifies(sighashType: Int?) {
         val key = signingKey()
         val psbt = p2wpkhPsbt(sighashType)
-        val signed = (psbt.sign(key, 0) as Either.Right).value.psbt
+        // These PSBTs carry witness_utxo only and exercise every defined ECDSA sighash type, so
+        // they need the permissive policy; SignPolicyTest covers the strict defaults.
+        val signed = (psbt.sign(key, 0, SignPolicy.Permissive) as Either.Right).value.psbt
         val sig = signed.inputs[0].partialSigs[key.publicKey()]!!
 
         assertEquals(
@@ -78,7 +80,7 @@ class SegwitV0SighashTest {
     /** SIGHASH_DEFAULT is taproot-only; on segwit v0 the trailing 0x00 byte is undefined. */
     @Test
     fun refusesSighashDefaultOnSegwitV0() {
-        val result = p2wpkhPsbt(SigHash.SIGHASH_DEFAULT).sign(signingKey(), 0)
+        val result = p2wpkhPsbt(SigHash.SIGHASH_DEFAULT).sign(signingKey(), 0, SignPolicy.Permissive)
 
         assertTrue("0x00 is not a defined ECDSA hashtype: $result", result is Either.Left)
         assertTrue((result as Either.Left).value is UpdateFailure.UnsupportedSighashType)
@@ -86,7 +88,7 @@ class SegwitV0SighashTest {
 
     @Test
     fun refusesUndefinedSighashTypeOnSegwitV0() {
-        val result = p2wpkhPsbt(0x41).sign(signingKey(), 0)
+        val result = p2wpkhPsbt(0x41).sign(signingKey(), 0, SignPolicy.Permissive)
 
         assertTrue("0x41 is not a defined ECDSA hashtype: $result", result is Either.Left)
         assertTrue((result as Either.Left).value is UpdateFailure.UnsupportedSighashType)
@@ -98,7 +100,7 @@ class SegwitV0SighashTest {
      */
     @Test
     fun refusesSighashTypeWiderThanOneByte() {
-        val result = p2wpkhPsbt(0x101).sign(signingKey(), 0)
+        val result = p2wpkhPsbt(0x101).sign(signingKey(), 0, SignPolicy.Permissive)
 
         assertTrue("0x101 must be refused: $result", result is Either.Left)
         assertTrue((result as Either.Left).value is UpdateFailure.UnsupportedSighashType)
@@ -106,7 +108,7 @@ class SegwitV0SighashTest {
 
     @Test
     fun refusesNegativeSighashTypeOnSegwitV0() {
-        val result = p2wpkhPsbt(-1).sign(signingKey(), 0)
+        val result = p2wpkhPsbt(-1).sign(signingKey(), 0, SignPolicy.Permissive)
 
         assertTrue("a negative sighash type must be refused: $result", result is Either.Left)
         assertTrue((result as Either.Left).value is UpdateFailure.UnsupportedSighashType)

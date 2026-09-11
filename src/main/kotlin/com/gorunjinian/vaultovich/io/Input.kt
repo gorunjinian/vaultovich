@@ -7,4 +7,4 @@ interface Input {
 }
 
 /** Read bytes from the input. Return null if the input is too small. */
-fun Input.readNBytes(n: Int): ByteArray? = if (availableBytes < n) null else ByteArray(n).also { read(it, 0, n) }
+fun Input.readNBytes(n: Int): ByteArray? = if (n < 0 || availableBytes < n) null else ByteArray(n).also { read(it, 0, n) }

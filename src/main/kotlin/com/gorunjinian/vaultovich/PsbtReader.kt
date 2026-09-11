@@ -68,6 +68,7 @@ internal object PsbtReader {
                         }
                         when {
                             tx.txIn.any { input -> input.hasWitness || !input.signatureScript.isEmpty() } -> return Either.Left(ParseFailure.InvalidGlobalTx("global tx inputs must have empty scriptSigs and witness"))
+                            tx.txOut.any { !it.hasValidAmount() } -> return Either.Left(ParseFailure.InvalidGlobalTx("global tx output amount out of range"))
                             else -> tx
                         }
                     }
@@ -122,6 +123,7 @@ internal object PsbtReader {
                         }
                         when {
                             inputTx.txid != txIn.outPoint.txid || txIn.outPoint.index >= inputTx.txOut.size -> return Either.Left(ParseFailure.InvalidTxInput("non-witness utxo does not match psbt outpoint"))
+                            inputTx.txOut.any { !it.hasValidAmount() } -> return Either.Left(ParseFailure.InvalidTxInput("non-witness utxo amount out of range"))
                             else -> inputTx
                         }
                     }
@@ -136,6 +138,7 @@ internal object PsbtReader {
                         } catch (e: Exception) {
                             return Either.Left(ParseFailure.InvalidTxInput(e.message ?: "failed to parse transaction output"))
                         }
+                        if (!txOut.hasValidAmount()) return Either.Left(ParseFailure.InvalidTxInput("witness utxo amount out of range"))
                         nonWitnessUtxo?.let { tx -> if (tx.txOut[txIn.outPoint.index.toInt()] != txOut) return Either.Left(ParseFailure.InvalidTxInput("witness utxo does not match non-witness utxo output")) }
                         txOut
                     }
@@ -207,7 +210,7 @@ internal object PsbtReader {
                     it.key.size() != 33 -> return Either.Left(ParseFailure.InvalidTxInput("taproot derivation path key must contain exactly 32 bytes"))
                     else -> {
                         val xonlyPublicKey = XonlyPublicKey(it.key.drop(1).toByteArray().byteVector32())
-                        val path = TaprootBip32DerivationPath.read(it.value.toByteArray())
+                        val path = runCatching { TaprootBip32DerivationPath.read(it.value.toByteArray()) }.getOrElse { return Either.Left(ParseFailure.InvalidTxInput("failed to parse taproot bip32 derivation path")) }
                         xonlyPublicKey to path
                     }
                 }
@@ -316,7 +319,7 @@ internal object PsbtReader {
                     it.key.size() != 33 -> return Either.Left(ParseFailure.InvalidTxOutput("taproot derivation path key must contain exactly 32 bytes"))
                     else -> {
                         val xonlyPublicKey = XonlyPublicKey(it.key.drop(1).toByteArray().byteVector32())
-                        val path = TaprootBip32DerivationPath.read(it.value.toByteArray())
+                        val path = runCatching { TaprootBip32DerivationPath.read(it.value.toByteArray()) }.getOrElse { return Either.Left(ParseFailure.InvalidTxOutput("failed to parse taproot bip32 derivation path")) }
                         xonlyPublicKey to path
                     }
                 }
@@ -461,6 +464,7 @@ val globalKeyTypes = setOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xfb.toByte())
         val txOuts = ArrayList<TxOut>(parsedOutputs.size)
         for (f in parsedOutputs) {
             val amount = f.amount ?: return Either.Left(ParseFailure.InvalidTxOutput("PSBT_OUT_AMOUNT is required in PSBTv2"))
+            if (amount !in 0..Satoshi.MAX_MONEY.sat) return Either.Left(ParseFailure.InvalidTxOutput("PSBT_OUT_AMOUNT out of range"))
             val hasSpInfo = f.unknown.any { it.key.size() == 1 && it.key[0] == 0x09.toByte() }
             if (f.script == null && !hasSpInfo) {
                 return Either.Left(ParseFailure.InvalidTxOutput("either PSBT_OUT_SCRIPT or PSBT_OUT_SP_V0_INFO is required in PSBTv2"))
@@ -531,12 +535,14 @@ val globalKeyTypes = setOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xfb.toByte())
             when {
                 it.key.size() != 1 -> return Either.Left(ParseFailure.InvalidTxInput("non-witness utxo key must contain exactly 1 byte"))
                 else -> runCatching { Transaction.read(it.value.bytes) }.getOrElse { return Either.Left(ParseFailure.InvalidTxInput("failed to parse transaction")) }
+                    .also { tx -> if (tx.txOut.any { o -> !o.hasValidAmount() }) return Either.Left(ParseFailure.InvalidTxInput("non-witness utxo amount out of range")) }
             }
         }
         val witnessUtxo = known.find { it.key[0] == 0x01.toByte() }?.let {
             when {
                 it.key.size() != 1 -> return Either.Left(ParseFailure.InvalidTxInput("witness utxo key must contain exactly 1 byte"))
                 else -> runCatching { TxOut.read(it.value.bytes) }.getOrElse { return Either.Left(ParseFailure.InvalidTxInput("failed to parse transaction output")) }
+                    .also { o -> if (!o.hasValidAmount()) return Either.Left(ParseFailure.InvalidTxInput("witness utxo amount out of range")) }
             }
         }
         val partialSigs = known.filter { it.key[0] == 0x02.toByte() }.map {
@@ -601,7 +607,7 @@ val globalKeyTypes = setOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xfb.toByte())
                 it.key.size() != 33 -> return Either.Left(ParseFailure.InvalidTxInput("taproot derivation path key must contain exactly 32 bytes"))
                 else -> {
                     val xonlyPublicKey = XonlyPublicKey(it.key.drop(1).toByteArray().byteVector32())
-                    val path = TaprootBip32DerivationPath.read(it.value.toByteArray())
+                    val path = runCatching { TaprootBip32DerivationPath.read(it.value.toByteArray()) }.getOrElse { return Either.Left(ParseFailure.InvalidTxInput("failed to parse taproot bip32 derivation path")) }
                     xonlyPublicKey to path
                 }
             }
@@ -724,7 +730,7 @@ val globalKeyTypes = setOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xfb.toByte())
                 it.key.size() != 33 -> return Either.Left(ParseFailure.InvalidTxOutput("taproot derivation path key must contain exactly 32 bytes"))
                 else -> {
                     val xonlyPublicKey = XonlyPublicKey(it.key.drop(1).toByteArray().byteVector32())
-                    val path = TaprootBip32DerivationPath.read(it.value.toByteArray())
+                    val path = runCatching { TaprootBip32DerivationPath.read(it.value.toByteArray()) }.getOrElse { return Either.Left(ParseFailure.InvalidTxOutput("failed to parse taproot bip32 derivation path")) }
                     xonlyPublicKey to path
                 }
             }
@@ -763,34 +769,46 @@ val globalKeyTypes = setOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xfb.toByte())
         object EndOfDataMap : ReadEntryFailure()
     }
 
-    private fun readDataMap(input: com.gorunjinian.vaultovich.io.Input, entries: List<DataEntry> = listOf()): Either<ReadEntryFailure, List<DataEntry>> {
-        return when (val result = readDataEntry(input)) {
-            is Either.Right -> readDataMap(input, entries + result.value)
-            is Either.Left -> when (result.value) {
-                is ReadEntryFailure.EndOfDataMap -> {
-                    if (entries.map { it.key }.toSet().size != entries.size) {
-                        Either.Left(ReadEntryFailure.DuplicateKeys)
-                    } else {
-                        Either.Right(entries)
-                    }
+    /**
+     * Read one BIP-174 key-value map up to its `0x00` separator. Iterative: the input is
+     * attacker-controlled (QR codes), and a recursive reader overflows the stack on a few tens of
+     * thousands of entries. BIP-174: "PSBTs containing duplicate keys are invalid."
+     */
+    private fun readDataMap(input: com.gorunjinian.vaultovich.io.Input): Either<ReadEntryFailure, List<DataEntry>> {
+        val entries = ArrayList<DataEntry>()
+        val keys = HashSet<ByteVector>()
+        while (true) {
+            when (val result = readDataEntry(input)) {
+                is Either.Right -> {
+                    if (!keys.add(result.value.key)) return Either.Left(ReadEntryFailure.DuplicateKeys)
+                    entries.add(result.value)
                 }
-
-                is ReadEntryFailure.InvalidData -> Either.Left(ReadEntryFailure.InvalidData)
-                else -> Either.Left(result.value)
+                is Either.Left -> return when (result.value) {
+                    is ReadEntryFailure.EndOfDataMap -> Either.Right(entries)
+                    else -> Either.Left(result.value)
+                }
             }
         }
     }
 
+    /** A compact-size length is only usable if the bytes it announces are actually present. */
+    private fun readLength(input: com.gorunjinian.vaultovich.io.Input): Int? {
+        if (input.availableBytes == 0) return null
+        val length = runCatching { BtcSerializer.varint(input) }.getOrElse { return null }
+        return if (length > input.availableBytes.toULong()) null else length.toInt()
+    }
+
     private fun readDataEntry(input: com.gorunjinian.vaultovich.io.Input): Either<ReadEntryFailure, DataEntry> {
-        if (input.availableBytes == 0) return Either.Left(ReadEntryFailure.InvalidData)
-        val keyLength = BtcSerializer.varint(input).toInt()
+        val keyLength = readLength(input) ?: return Either.Left(ReadEntryFailure.InvalidData)
         if (keyLength == 0) return Either.Left(ReadEntryFailure.EndOfDataMap)
         val key = input.readNBytes(keyLength) ?: return Either.Left(ReadEntryFailure.InvalidData)
 
-        if (input.availableBytes == 0) return Either.Left(ReadEntryFailure.InvalidData)
-        val valueLength = BtcSerializer.varint(input).toInt()
+        val valueLength = readLength(input) ?: return Either.Left(ReadEntryFailure.InvalidData)
         val value = input.readNBytes(valueLength) ?: return Either.Left(ReadEntryFailure.InvalidData)
 
         return Either.Right(DataEntry(ByteVector(key), ByteVector(value)))
     }
+
+    /** Consensus range for an amount we are asked to treat as a real UTXO or output. */
+    private fun TxOut.hasValidAmount(): Boolean = amount.sat in 0..Satoshi.MAX_MONEY.sat
 }
