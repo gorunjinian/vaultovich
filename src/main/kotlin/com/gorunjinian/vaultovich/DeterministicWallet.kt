@@ -15,8 +15,14 @@ import kotlin.jvm.JvmStatic
 object DeterministicWallet {
     const val hardenedKeyIndex: Long = 0x80000000L
 
+    /** Largest child index before the hardened range, 2^31 - 1. */
+    const val maxChildIndex: Long = 0x7FFFFFFFL
+
     @JvmStatic
-    fun hardened(index: Long): Long = hardenedKeyIndex + index
+    fun hardened(index: Long): Long {
+        require(index in 0..maxChildIndex) { "child index must be between 0 and 2^31 - 1" }
+        return hardenedKeyIndex + index
+    }
 
     @JvmStatic
     fun isHardened(index: Long): Boolean = index >= hardenedKeyIndex
@@ -43,6 +49,7 @@ object DeterministicWallet {
          * @return the derived private key at the specified index
          */
         fun derivePrivateKey(index: Long): ExtendedPrivateKey {
+            require(index in 0..0xFFFFFFFFL) { "child index must be between 0 and 2^32 - 1" }
             val I = if (isHardened(index)) {
                 val data = arrayOf(0.toByte()).toByteArray() + secretkeybytes.toByteArray() + Pack.writeInt32BE(index.toInt())
                 Crypto.hmac512(chaincode.toByteArray(), data)
@@ -133,6 +140,7 @@ object DeterministicWallet {
          * @return the derived public key at the specified index
          */
         fun derivePublicKey(index: Long): ExtendedPublicKey {
+            require(index in 0..0xFFFFFFFFL) { "child index must be between 0 and 2^32 - 1" }
             require(!isHardened(index)) { "Cannot derive public keys from public hardened keys" }
 
             val I = Crypto.hmac512(
@@ -311,6 +319,12 @@ object DeterministicWallet {
 data class KeyPath(@JvmField val path: List<Long>) {
     constructor(path: String) : this(computePath(path))
 
+    init {
+        // BIP-32 child indices are 32-bit; anything else would be silently truncated on the wire and
+        // derive a key that no other wallet can reproduce from the path as displayed.
+        require(path.all { it in 0..0xFFFFFFFFL }) { "child index must be between 0 and 2^32 - 1" }
+    }
+
     val lastChildNumber: Long get() = if (path.isEmpty()) 0L else path.last()
 
     fun derive(number: Long): KeyPath = KeyPath(path + listOf(number))
@@ -336,7 +350,13 @@ data class KeyPath(@JvmField val path: List<Long>) {
 
         @JvmStatic
         fun computePath(path: String): List<Long> {
-            fun toNumber(value: String): Long = if (value.last() == '\'' || value.last() == 'h') hardened(value.dropLast(1).toLong()) else value.toLong()
+            fun toNumber(value: String): Long {
+                require(value.isNotEmpty()) { "empty path component" }
+                val isHardened = value.last() == '\'' || value.last() == 'h'
+                val n = (if (isHardened) value.dropLast(1) else value).toLong()
+                require(n in 0..DeterministicWallet.maxChildIndex) { "child index must be between 0 and 2^31 - 1" }
+                return if (isHardened) hardened(n) else n
+            }
 
             val path1 = path.removePrefix("m").removePrefix("/")
             return if (path1.isEmpty()) {

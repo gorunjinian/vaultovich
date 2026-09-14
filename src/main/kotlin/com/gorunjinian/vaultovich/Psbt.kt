@@ -2,6 +2,10 @@ package com.gorunjinian.vaultovich
 
 import com.gorunjinian.vaultovich.io.ByteArrayInput
 import com.gorunjinian.vaultovich.io.ByteArrayOutput
+import com.gorunjinian.vaultovich.silentpayments.SilentPaymentSpending
+import com.gorunjinian.vaultovich.silentpayments.hasSilentPaymentOutputs
+import com.gorunjinian.vaultovich.silentpayments.isSilentPaymentOutput
+import com.gorunjinian.vaultovich.silentpayments.silentPaymentTweak
 import com.gorunjinian.vaultovich.utils.Either
 import kotlin.jvm.JvmField
 import kotlin.jvm.JvmStatic
@@ -65,6 +69,7 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
 
     private fun sign(priv: PrivateKey, inputIndex: Int, input: Input, global: Global, policy: SignPolicy): Either<UpdateFailure, Pair<Input, ByteVector>> {
         val txIn = global.tx.txIn[inputIndex]
+        checkSilentPaymentRules(inputIndex, input)?.let { return Either.Left(it) }
         return when (input) {
             is Input.PartiallySignedInputWithoutUtxo -> Either.Left(UpdateFailure.CannotSignInput(inputIndex, "cannot sign: input hasn't been updated with utxo data"))
             is Input.WitnessInput.PartiallySignedWitnessInput -> {
@@ -103,6 +108,33 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
             is Input.NonWitnessInput.FinalizedNonWitnessInput -> Either.Left(UpdateFailure.CannotSignInput(inputIndex, "cannot sign: input has already been finalized"))
 
         }
+    }
+
+    /**
+     * BIP-375 signer rules, applied whenever an output carries `PSBT_OUT_SP_V0_INFO`:
+     *  - "All rules must be followed from PSBTv2" (the fields require exclusion in v0);
+     *  - "If any output does not have PSBT_OUT_SCRIPT set, the Signer must not yet add a signature";
+     *  - "If any input is spending an output with script using Segwit version > 1, the Signer must fail";
+     *  - "the signer must fail if the sighash type is not SIGHASH_ALL" (SIGHASH_DEFAULT is the taproot
+     *    spelling of the same commitment and is accepted).
+     */
+    private fun checkSilentPaymentRules(inputIndex: Int, input: Input): UpdateFailure? {
+        if (!hasSilentPaymentOutputs) return null
+        fun violation(reason: String) = UpdateFailure.SilentPaymentRuleViolation(inputIndex, reason)
+        if (global.version < 2) return violation("silent payment PSBTs must be version 2")
+        outputs.forEachIndexed { i, output ->
+            if (output.isSilentPaymentOutput && global.tx.txOut[i].publicKeyScript.isEmpty()) return violation("output $i has no script yet")
+        }
+        inputs.forEachIndexed { i, other ->
+            val spent = other.witnessUtxo ?: other.nonWitnessUtxo?.txOut?.getOrNull(global.tx.txIn[i].outPoint.index.toInt())
+            val version = spent?.let { runCatching { Script.getWitnessVersion(Script.parse(it.publicKeyScript)) }.getOrNull() }
+            if (version != null && version > 1) return violation("input $i spends a segwit version $version output")
+        }
+        val isTaproot = input.witnessUtxo?.let { runCatching { Script.isPay2tr(it.publicKeyScript) }.getOrDefault(false) } ?: false
+        val sighashType = input.sighashType ?: (if (isTaproot) SigHash.SIGHASH_DEFAULT else SigHash.SIGHASH_ALL)
+        val allowed = if (isTaproot) setOf(SigHash.SIGHASH_DEFAULT, SigHash.SIGHASH_ALL) else setOf(SigHash.SIGHASH_ALL)
+        if (sighashType !in allowed) return violation("sighash type must be SIGHASH_ALL when paying silent payment outputs")
+        return null
     }
 
     /**
@@ -189,20 +221,33 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
                 else -> signWitnessScript(input.witnessScript)
             }
             Script.isPay2tr(pubkeyScript) -> {
-                // BIP-86 key-path signing. `signInputTaprootKeyPath` below always applies the
-                // *no-script* TapTweak, so verify that this actually reproduces the output key
-                // committed to by the scriptPubKey before signing, rather than trusting the declared
-                // PSBT_IN_TAP_INTERNAL_KEY. Checking the script is strictly stronger: it also rejects
-                // outputs that commit to a script tree (where the correct tweak is the merkle-root
-                // one), which would otherwise be signed with the wrong tweak and yield a silently
-                // invalid signature.
                 val sighashType = input.sighashType ?: SigHash.SIGHASH_DEFAULT
-                val signingKey = XonlyPublicKey(priv.publicKey())
-                val expectedOutputKey = signingKey.outputKey(Crypto.TaprootTweak.NoScriptTweak).first
                 val actualOutputKey = Script.pay2trOutputKey(pubkeyScript)
-                // Guard before `hashForSigningSchnorr`, whose own `require` accepts any negative
-                // value (a PSBT declaring 0xFFFFFFFF parses to -1) and would then mask it into
-                // SIGHASH_SINGLE | SIGHASH_ANYONECANPAY, and which *throws* for values like 0x41
+                // Two ways to hold a taproot key:
+                //  - BIP-86 key path: `priv` is the internal key and the no-script TapTweak is applied.
+                //  - a received silent payment (BIP-352 / BIP-375): the watching wallet supplies
+                //    `PSBT_IN_SP_TWEAK`, we sign with `d = b_spend + tweak`, and `d`'s x-only key *is*
+                //    the output key (silent-payment outputs carry no TapTweak).
+                // Either way the key we would sign with must reproduce the output key committed to by
+                // the scriptPubKey, rather than trusting any declared PSBT field. Checking the script is
+                // strictly stronger: it also rejects outputs that commit to a script tree (where the
+                // correct tweak is the merkle-root one), which would otherwise yield a silently invalid
+                // signature.
+                val spTweak = runCatching { input.silentPaymentTweak }
+                    .getOrElse { return Either.Left(UpdateFailure.CannotSignInput(inputIndex, "malformed silent payment tweak")) }
+                val signingKey: PrivateKey
+                val tweak: Crypto.TaprootTweak?
+                if (spTweak != null) {
+                    signingKey = runCatching { SilentPaymentSpending.deriveSpendingPrivateKey(priv, spTweak) }
+                        .getOrElse { return Either.Left(UpdateFailure.CannotSignInput(inputIndex, "invalid silent payment tweak")) }
+                    tweak = null
+                } else {
+                    signingKey = priv
+                    tweak = Crypto.TaprootTweak.NoScriptTweak
+                }
+                val expectedOutputKey = if (tweak == null) signingKey.xOnlyPublicKey() else signingKey.xOnlyPublicKey().outputKey(tweak).first
+                // Guard before `hashForSigningSchnorr`, whose own `require` used to accept any negative
+                // value (a PSBT declaring 0xFFFFFFFF parses to -1) and *throws* for values like 0x41
                 // (or SIGHASH_SINGLE past the last output) instead of returning a failure.
                 val sighashFailure = checkSighashType(inputIndex, sighashType, SigHash::isValidTaproot, policy)
                 when {
@@ -210,14 +255,19 @@ data class Psbt(@JvmField val global: Global, @JvmField val inputs: List<Input>,
                     actualOutputKey == null ->
                         Either.Left(UpdateFailure.InvalidWitnessUtxo("could not read the taproot output key"))
                     actualOutputKey != expectedOutputKey ->
-                        Either.Left(taprootKeyPathRefusal(inputIndex, input, signingKey, actualOutputKey))
+                        if (tweak == null) Either.Left(UpdateFailure.CannotSignInput(inputIndex, "silent payment tweak does not reproduce the output key"))
+                        else Either.Left(taprootKeyPathRefusal(inputIndex, input, signingKey.xOnlyPublicKey(), actualOutputKey))
                     else -> {
                         // When spending taproot inputs, we include *all* of the transaction's inputs in the signed hash.
                         val spentOutputs = this.inputs.mapIndexedNotNull { idx, txIn -> txIn.witnessUtxo ?: txIn.nonWitnessUtxo?.txOut?.get(this.global.tx.txIn[idx].outPoint.index.toInt()) }
                         if (spentOutputs.size != this.inputs.size) {
                             Either.Left(UpdateFailure.InvalidInput("missing txOut for one of our inputs"))
                         } else {
-                            val sig = Transaction.signInputTaprootKeyPath(priv, global.tx, inputIndex, spentOutputs, sighashType, null)
+                            val sig = if (tweak == null) {
+                                Crypto.signSchnorr(global.tx.hashForSigningTaprootKeyPath(inputIndex, spentOutputs, sighashType), signingKey, null)
+                            } else {
+                                Transaction.signInputTaprootKeyPath(signingKey, global.tx, inputIndex, spentOutputs, sighashType, null)
+                            }
                             // BIP-341: a 64-byte signature implies SIGHASH_DEFAULT, and a 65-byte one
                             // whose trailing byte is 0x00 is *invalid* — that rule exists to stop
                             // 64-byte signatures being malleated into 65-byte ones. So append the

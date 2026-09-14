@@ -606,7 +606,9 @@ data class Transaction(
     ): ByteVector32 {
         val out = ByteArrayOutput()
         out.write(0)
-        require(sighashType <= 0x03 || (sighashType in 0x81..0x83))
+        // BIP-341 allow-list (a negative Int must not slip through as its low byte).
+        require(SigHash.isValidTaproot(sighashType)) { "invalid taproot sighash type" }
+        require(!SigHash.isHashSingle(sighashType) || inputIndex < txOut.size) { "SIGHASH_SINGLE without a matching output" }
 
         out.write(sighashType)
         val txData = transactionData(inputs, sighashType)

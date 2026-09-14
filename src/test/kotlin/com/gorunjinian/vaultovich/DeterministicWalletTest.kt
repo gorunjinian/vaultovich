@@ -254,7 +254,7 @@ class DeterministicWalletTest {
         for (i in 0..50) {
             val master = generate(random.nextBytes(32))
             for (j in 0..50) {
-                val index = random.nextLong()
+                val index = random.nextLong(0, 0x1_0000_0000L)
                 val priv = master.derivePrivateKey(index)
                 val encodedPriv = priv.encode(DeterministicWallet.tprv)
                 val (prefixPriv, decodedPriv) = DeterministicWallet.ExtendedPrivateKey.decode(encodedPriv)

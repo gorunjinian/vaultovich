@@ -7,6 +7,7 @@ import com.gorunjinian.vaultovich.Global
 import com.gorunjinian.vaultovich.Input
 import com.gorunjinian.vaultovich.OutPoint
 import com.gorunjinian.vaultovich.Output
+import com.gorunjinian.vaultovich.ParseFailure
 import com.gorunjinian.vaultovich.Psbt
 import com.gorunjinian.vaultovich.Satoshi
 import com.gorunjinian.vaultovich.Script
@@ -19,6 +20,7 @@ import com.gorunjinian.vaultovich.utils.Either
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SilentPaymentPsbtFieldTest {
@@ -52,7 +54,8 @@ class SilentPaymentPsbtFieldTest {
         )
         val output = Output.UnspecifiedOutput(emptyMap(), null, emptyMap(), outputEntries)
 
-        return Psbt(Global(0, tx, emptyList(), emptyList()), listOf(input), listOf(output))
+        // BIP-375: silent-payment fields are only allowed in PSBT v2.
+        return Psbt(Global(2, tx, emptyList(), emptyList()), listOf(input), listOf(output))
     }
 
     @Test
@@ -97,10 +100,10 @@ class SilentPaymentPsbtFieldTest {
     }
 
     @Test
-    fun globalSpProofFieldsAreStrippedFromV0AndKeptInV2() {
-        // BIP-375 forbids PSBT_GLOBAL_SP_ECDH_SHARE/PSBT_GLOBAL_SP_DLEQ in v0: the writer must
-        // drop them even if they rode in via a spec-violating PSBT's unknown entries, while a v2
-        // PSBT must round-trip them intact.
+    fun silentPaymentFieldsRequireV2() {
+        // BIP-375: every SP field "requires exclusion" in v0. The writer refuses to produce such a
+        // PSBT (rather than silently dropping proofs the signer just made), the reader refuses to
+        // accept one, and a v2 PSBT round-trips the global proofs intact.
         val recipient = SilentPaymentAddress.decode(standardAddress)
         val scanKeyBytes = recipient.scanPubKey.value.toByteArray()
         val proofEntries = listOf(
@@ -108,14 +111,33 @@ class SilentPaymentPsbtFieldTest {
             DataEntry(ByteVector(byteArrayOf(0x08) + scanKeyBytes), ByteVector(ByteArray(64)))
         )
 
-        val v0 = buildSpPsbt()
-        val v0WithProofs = v0.copy(global = v0.global.copy(unknown = v0.global.unknown + proofEntries))
-        val v0Reread = (Psbt.read(Psbt.write(v0WithProofs)) as Either.Right).value
-        assertEquals(0, v0Reread.global.unknown.count { it.key.size() == 34 && (it.key[0] == 0x07.toByte() || it.key[0] == 0x08.toByte()) })
-
-        val v2WithProofs = v0WithProofs.copy(global = v0WithProofs.global.copy(version = 2))
+        val v2 = buildSpPsbt()
+        val v2WithProofs = v2.copy(global = v2.global.copy(unknown = v2.global.unknown + proofEntries))
         val v2Reread = (Psbt.read(Psbt.write(v2WithProofs)) as Either.Right).value
         assertEquals(2, v2Reread.global.unknown.count { it.key.size() == 34 && (it.key[0] == 0x07.toByte() || it.key[0] == 0x08.toByte()) })
+
+        val v0 = v2.copy(global = v2.global.copy(version = 0))
+        assertThrows(IllegalArgumentException::class.java) { Psbt.write(v0) }
+
+        // A v0 PSBT that carries the output field on the wire is invalid.
+        val v0Bytes = Psbt.write(v2.copy(global = v2.global.copy(version = 0), inputs = v2.inputs.map { stripUnknown(it) }, outputs = v2.outputs.map { stripUnknown(it) }))
+        assertTrue(Psbt.read(v0Bytes) is Either.Right)
+        val v0WithSpOutput = v0Bytes.toByteArray().let { bytes ->
+            // Re-encode by hand: insert PSBT_OUT_SP_V0_INFO into the (single, empty) output map, i.e. replace the final 0x00 separator.
+            bytes.copyOf(bytes.size - 1) + byteArrayOf(0x01, 0x09, 66) + recipient.scanPubKey.value.toByteArray() + recipient.spendPubKey.value.toByteArray() + byteArrayOf(0x00)
+        }
+        val result = Psbt.read(v0WithSpOutput)
+        assertTrue("expected InvalidPsbtVersion, got $result", (result as? Either.Left)?.value is ParseFailure.InvalidPsbtVersion)
+    }
+
+    private fun stripUnknown(input: Input): Input = when (input) {
+        is Input.WitnessInput.PartiallySignedWitnessInput -> input.copy(unknown = emptyList())
+        else -> error("unexpected input type in test")
+    }
+
+    private fun stripUnknown(output: Output): Output = when (output) {
+        is Output.UnspecifiedOutput -> output.copy(unknown = emptyList())
+        else -> error("unexpected output type in test")
     }
 
     @Test

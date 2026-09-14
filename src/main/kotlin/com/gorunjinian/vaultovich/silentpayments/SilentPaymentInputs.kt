@@ -8,10 +8,10 @@ import com.gorunjinian.vaultovich.Script
  * Classifies a spent input as one of the BIP-352 shared-secret-eligible kinds, or `INELIGIBLE`.
  *
  * Pure classifier over the raw spending pieces (the scriptPubKey of the output being spent, plus
- * the redeem script / witness when relevant). We always have the private key from BIP-32
- * derivation, so unlike a receiver we never extract a pubkey out of the scriptSig/witness — we
- * only need to know the *kind* of input (and whether it's taproot, for even-Y negation) and
- * whether it must be skipped entirely (NUMS-`H` script-path taproot spends).
+ * the redeem script / witness when relevant). It decides the *kind* of input and whether it must be
+ * skipped entirely (NUMS-`H` script-path taproot spends). Whether the key we hold actually matches
+ * the script, and the BIP-352 rule that uncompressed-key inputs are skipped, are checked in
+ * [SilentPayments.eligibleKey], which callers should use rather than building keys by hand.
  */
 object SilentPaymentInputs {
     /**

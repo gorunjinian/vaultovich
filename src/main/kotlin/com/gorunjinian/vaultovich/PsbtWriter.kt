@@ -4,7 +4,7 @@ import com.gorunjinian.vaultovich.crypto.Pack
 import com.gorunjinian.vaultovich.io.ByteArrayOutput
 
 
-import com.gorunjinian.vaultovich.silentpayments.Bip374Fields
+import com.gorunjinian.vaultovich.silentpayments.hasSilentPaymentFields
 
 /**
  * Serializes a [Psbt] to bytes. Extracted from `Psbt`'s companion; [Psbt.write] delegates here.
@@ -72,6 +72,9 @@ internal object PsbtWriter {
 
     /** BIP-174 (v0) serialization: the transaction lives in the global `0x00` unsigned-tx entry. */
     private fun writeV0(psbt: Psbt, out: com.gorunjinian.vaultovich.io.Output) {
+        // BIP-375: every silent-payment field "requires exclusion" in v0. Dropping them silently would
+        // discard proofs the signer just produced, so a v0 PSBT carrying any of them is a caller error.
+        require(!psbt.hasSilentPaymentFields) { "silent payment fields require PSBT version 2 (BIP-375)" }
         writeMagic(out)
 
         /********** Global types **********/
@@ -80,9 +83,7 @@ internal object PsbtWriter {
         if (psbt.global.version > 0) {
             writeDataEntry(DataEntry(ByteVector("fb"), ByteVector(Pack.writeInt32LE(psbt.global.version.toInt()))), out)
         }
-        // BIP-375 forbids the global SP ECDH share/DLEQ proof fields in v0 — drop any that rode
-        // in via `unknown` rather than emit a PSBT every BIP-375 parser must reject.
-        psbt.global.unknown.filterNot(Bip374Fields::isGlobalSilentPaymentProofEntry).forEach { writeDataEntry(it, out) }
+        psbt.global.unknown.forEach { writeDataEntry(it, out) }
         out.write(0x00) // separator
 
         /********** Inputs **********/

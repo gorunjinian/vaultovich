@@ -361,6 +361,14 @@ sealed class UpdateFailure {
     data class KeyDoesNotMatchInput(val index: Int) : UpdateFailure()
 
     /**
+     * The PSBT pays a silent-payment recipient and breaks one of the BIP-375 signer rules: it must
+     * be version 2, every silent-payment output must already carry its derived script, no input may
+     * spend a segwit version above 1, and the sighash type must be SIGHASH_ALL (SIGHASH_DEFAULT on
+     * taproot). [reason] says which.
+     */
+    data class SilentPaymentRuleViolation(val index: Int, val reason: String) : UpdateFailure()
+
+    /**
      * A taproot output commits to a script tree, so the BIP-86 (no-script) key-path signature we
      * produce cannot satisfy it. [merkleRoot] is non-null when the PSBT declared
      * `PSBT_IN_TAP_MERKLE_ROOT` and it verifiably matches the output being spent.

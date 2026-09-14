@@ -73,7 +73,12 @@ data class Session(private val data: ByteVector, private val keyAggCache: KeyAgg
      * @return a musig2 partial signature.
      */
     fun sign(secretNonce: SecretNonce, privateKey: PrivateKey): ByteVector32 {
-        return Secp256k1.musigPartialSign(secretNonce.data.toByteArray(), privateKey.value.toByteArray(), keyAggCache.toByteArray(), this.toByteArray()).byteVector32()
+        val nonce = secretNonce.consume()
+        try {
+            return Secp256k1.musigPartialSign(nonce, privateKey.value.toByteArray(), keyAggCache.toByteArray(), this.toByteArray()).byteVector32()
+        } finally {
+            nonce.fill(0)
+        }
     }
 
     /**
@@ -118,26 +123,59 @@ data class Session(private val data: ByteVector, private val keyAggCache: KeyAgg
 }
 
 /**
- * Musig2 secret nonce, that should be treated as a private opaque blob.
- * This nonce must never be persisted or reused across signing sessions.
+ * Musig2 secret nonce: an opaque, single-use secret.
+ *
+ * BIP-327: "The Sign algorithm must not be executed twice with the same secnonce", and it
+ * recommends erasing the nonce once read. libsecp256k1 does erase its own copy, but that never
+ * reaches the JVM, so this class enforces single use itself: [Session.sign] consumes the nonce,
+ * wipes the bytes, and any second use throws. There is deliberately no way to serialise one.
  */
-data class SecretNonce(internal val data: ByteVector) {
-    constructor(bin: ByteArray) : this(bin.byteVector())
-    constructor(hex: String) : this(Hex.decode(hex))
+class SecretNonce(bin: ByteArray) {
+    private val bytes: ByteArray = bin.copyOf()
+    private var consumed: Boolean = false
 
     init {
-        require(data.size() == Secp256k1.MUSIG2_SECRET_NONCE_SIZE) { "musig2 secret nonce must be ${Secp256k1.MUSIG2_SECRET_NONCE_SIZE} bytes" }
+        require(bytes.size == Secp256k1.MUSIG2_SECRET_NONCE_SIZE) { "musig2 secret nonce must be ${Secp256k1.MUSIG2_SECRET_NONCE_SIZE} bytes" }
+    }
+
+    /** True once the nonce has been handed to a signing session. */
+    val isConsumed: Boolean get() = synchronized(this) { consumed }
+
+    /** Take the nonce bytes exactly once and wipe the stored copy. The caller must wipe the returned array. */
+    internal fun consume(): ByteArray = synchronized(this) {
+        check(!consumed) { "musig2 secret nonce has already been used: signing twice with one nonce leaks the private key" }
+        consumed = true
+        val out = bytes.copyOf()
+        bytes.fill(0)
+        out
     }
 
     override fun toString(): String = "<secret_nonce>"
 
     companion object {
+        /** A fresh 32-byte session id from the platform CSPRNG. */
+        @JvmStatic
+        fun randomSessionId(): ByteVector32 = ByteVector32(ByteArray(32).also { java.security.SecureRandom().nextBytes(it) })
+
+        /**
+         * Generate a secret nonce to be used in a musig2 signing session, with a fresh random session id.
+         *
+         * @param signingKey signer's private key or public key.
+         * @param message (optional) message that will be signed, if already known.
+         * @param keyAggCache (optional) key aggregation cache data from the signing session.
+         * @param extraInput (optional) additional random data.
+         * @return secret nonce and the corresponding public nonce.
+         */
+        @JvmStatic
+        fun generate(signingKey: Either<PrivateKey, PublicKey>, message: ByteVector32?, keyAggCache: KeyAggCache?, extraInput: ByteVector32?): Pair<SecretNonce, IndividualNonce> =
+            generate(randomSessionId(), signingKey, message, keyAggCache, extraInput)
+
         /**
          * Generate a secret nonce to be used in a musig2 signing session.
          * This nonce must never be persisted or reused across signing sessions.
          * All optional arguments exist to enrich the quality of the randomness used, which is critical for security.
          *
-         * @param sessionId unique session ID.
+         * @param sessionId unique session ID: must never repeat for the same signing key (prefer [randomSessionId]).
          * @param signingKey signer's private key or public key.
          * @param message (optional) message that will be signed, if already known.
          * @param keyAggCache (optional) key aggregation cache data from the signing session.
@@ -151,15 +189,11 @@ data class SecretNonce(internal val data: ByteVector) {
                 is Either.Right -> Pair(null, signingKey.value)
             }
             val nonce = Secp256k1.musigNonceGen(sessionId.toByteArray(), privateKey?.value?.toByteArray(), publicKey.value.toByteArray(), message?.toByteArray(), keyAggCache?.toByteArray(), extraInput?.toByteArray())
-            val secretNonce = SecretNonce(nonce.copyOfRange(0, Secp256k1.MUSIG2_SECRET_NONCE_SIZE))
-            val publicNonce = IndividualNonce(nonce.copyOfRange(Secp256k1.MUSIG2_SECRET_NONCE_SIZE, Secp256k1.MUSIG2_SECRET_NONCE_SIZE + Secp256k1.MUSIG2_PUBLIC_NONCE_SIZE))
-            return Pair(secretNonce, publicNonce)
+            return split(nonce)
         }
 
         /**
          * Generate a secret nonce to be used in a musig2 signing session.
-         * This nonce must never be persisted or reused across signing sessions.
-         * All optional arguments exist to enrich the quality of the randomness used, which is critical for security.
          *
          * @param sessionId unique session ID.
          * @param privateKey (optional) signer's private key.
@@ -178,9 +212,9 @@ data class SecretNonce(internal val data: ByteVector) {
         }
 
         /**
-         * Alternative counter-based method for generating nonce.
-         * This nonce must never be persisted or reused across signing sessions.
-         * All optional arguments exist to enrich the quality of the randomness used, which is critical for security.
+         * Alternative counter-based method for generating nonce (BIP-327 NonceGen with a counter).
+         * The counter must never repeat for the same private key, including across device restores
+         * from the same seed: if that cannot be guaranteed, use the random session id variant.
          *
          * @param nonRepeatingCounter non-repeating counter that must never be reused with the same private key.
          * @param privateKey signer's private key.
@@ -192,8 +226,13 @@ data class SecretNonce(internal val data: ByteVector) {
         @JvmStatic
         fun generateWithCounter(nonRepeatingCounter: Long, privateKey: PrivateKey, message: ByteVector32?, keyAggCache: KeyAggCache?, extraInput: ByteVector32?): Pair<SecretNonce, IndividualNonce> {
             val nonce = Secp256k1.musigNonceGenCounter(nonRepeatingCounter.toULong(), privateKey.value.toByteArray(), message?.toByteArray(), keyAggCache?.toByteArray(), extraInput?.toByteArray())
+            return split(nonce)
+        }
+
+        private fun split(nonce: ByteArray): Pair<SecretNonce, IndividualNonce> {
             val secretNonce = SecretNonce(nonce.copyOfRange(0, Secp256k1.MUSIG2_SECRET_NONCE_SIZE))
             val publicNonce = IndividualNonce(nonce.copyOfRange(Secp256k1.MUSIG2_SECRET_NONCE_SIZE, Secp256k1.MUSIG2_SECRET_NONCE_SIZE + Secp256k1.MUSIG2_PUBLIC_NONCE_SIZE))
+            nonce.fill(0)
             return Pair(secretNonce, publicNonce)
         }
     }
@@ -261,6 +300,15 @@ object Musig2 {
      */
     @JvmStatic
     fun aggregateKeys(publicKeys: List<PublicKey>): XonlyPublicKey = KeyAggCache.create(publicKeys).first
+
+    /**
+     * Generate a nonce for a musig2 session with a fresh random session id, the recommended way
+     * (BIP-327: the session id must never repeat for the same key; drawing it from a CSPRNG is
+     * the only option that cannot go wrong across device restores).
+     */
+    @JvmStatic
+    fun generateNonce(signingKey: Either<PrivateKey, PublicKey>, publicKeys: List<PublicKey>, message: ByteVector32?, extraInput: ByteVector32?): Pair<SecretNonce, IndividualNonce> =
+        generateNonce(SecretNonce.randomSessionId(), signingKey, publicKeys, message, extraInput)
 
     /**
      * @param sessionId a random, unique session ID.

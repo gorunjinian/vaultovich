@@ -3,6 +3,7 @@ package com.gorunjinian.vaultovich
 import com.gorunjinian.vaultovich.crypto.Pack
 import com.gorunjinian.vaultovich.io.ByteArrayInput
 import com.gorunjinian.vaultovich.io.readNBytes
+import com.gorunjinian.vaultovich.silentpayments.Bip374Fields
 import com.gorunjinian.vaultovich.utils.Either
 import com.gorunjinian.vaultovich.utils.getOrElse
 
@@ -44,6 +45,7 @@ internal object PsbtReader {
             }
             val keyTypes = setOf(0x00.toByte(), 0x01.toByte(), 0xfb.toByte())
             val (known, unknown) = globalMap.partition { keyTypes.contains(it.key[0]) }
+            if (unknown.any(Bip374Fields::isGlobalSilentPaymentEntry)) return Either.Left(ParseFailure.InvalidPsbtVersion("silent payment fields require PSBT v2"))
             val version = known.find { it.key[0] == 0xfb.toByte() }?.let {
                 when {
                     it.key.size() != 1 -> return Either.Left(ParseFailure.InvalidPsbtVersion("version key must contain exactly 1 byte"))
@@ -112,6 +114,7 @@ internal object PsbtReader {
                 }
             }
             val (known, unknown) = entries.partition { keyTypes.contains(it.key[0]) }
+            if (unknown.any(Bip374Fields::isInputSilentPaymentEntry)) return Either.Left(ParseFailure.InvalidPsbtVersion("silent payment fields require PSBT v2"))
             val nonWitnessUtxo = known.find { it.key[0] == 0x00.toByte() }?.let {
                 when {
                     it.key.size() != 1 -> return Either.Left(ParseFailure.InvalidTxInput("non-witness utxo key must contain exactly 1 byte"))
@@ -282,6 +285,7 @@ internal object PsbtReader {
                 }
             }
             val (known, unknown) = entries.partition { keyTypes.contains(it.key[0]) }
+            if (unknown.any(Bip374Fields::isOutputSilentPaymentEntry)) return Either.Left(ParseFailure.InvalidPsbtVersion("silent payment fields require PSBT v2"))
             val redeemScript = known.find { it.key[0] == 0x00.toByte() }?.let {
                 when {
                     it.key.size() != 1 -> return Either.Left(ParseFailure.InvalidTxOutput("redeem script key must contain exactly 1 byte"))
@@ -472,7 +476,7 @@ val globalKeyTypes = setOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xfb.toByte())
             txOuts.add(TxOut(Satoshi(amount), f.script ?: ByteVector.empty))
         }
 
-        val locktime = computeV2Locktime(parsedInputs, fallbackLocktime)
+        val locktime = computeV2Locktime(parsedInputs, fallbackLocktime).getOrElse { return Either.Left(it) }
         val tx = Transaction(txVersion, txIns, txOuts, locktime)
         val global = Global(psbtVersion, tx, xpubs, unknownGlobal, fallbackLocktime, txModifiable)
 
@@ -739,26 +743,39 @@ val globalKeyTypes = setOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xfb.toByte())
     }
 
     /**
-     * Determines the synthesized transaction locktime per BIP-370: the max of any per-input
-     * required locktimes (height preferred when mixed), else the fallback locktime, else 0.
-     * Per-input `PSBT_IN_REQUIRED_TIME_LOCKTIME` (0x11) / `_HEIGHT_LOCKTIME` (0x12) are left in
-     * each input's `unknown` (preserved on write); we read them here only to compute locktime.
+     * BIP-370 "Determining Lock Time".
+     *
+     * "If none of the inputs have a PSBT_IN_REQUIRED_TIME_LOCKTIME and PSBT_IN_REQUIRED_HEIGHT_LOCKTIME,
+     * then PSBT_GLOBAL_FALLBACK_LOCKTIME must be used. If PSBT_GLOBAL_FALLBACK_LOCKTIME is not
+     * provided, then it is assumed to be 0. If one or more inputs have [either field], then the
+     * field chosen is the one which is supported by all of the inputs. This can be determined by
+     * looking at all of the inputs which specify a locktime in either of those fields, and choosing
+     * the field which is present in all of those inputs. Inputs not specifying a lock time field can
+     * take both types of lock times, as can those that specify both. The lock time chosen is then
+     * the maximum value of the chosen type of lock time." When both types are possible, height wins.
+     * Inputs that constrain each other to incompatible types can never be satisfied, so that is a
+     * parse failure rather than a silent choice. Field ranges: time >= 500000000, 0 < height < 500000000.
+     * The fields stay in each input's `unknown` (preserved on write); they are read here only.
      */
-    private fun computeV2Locktime(inputs: List<ParsedV2Input>, fallbackLocktime: Long?): Long {
-        val fallback = fallbackLocktime ?: 0L
-        fun required(unknown: List<DataEntry>, keyType: Byte): Long? =
-            unknown.firstOrNull { it.key.size() == 1 && it.key[0] == keyType && it.value.size() == 4 }
-                ?.let { Pack.int32LE(it.value.bytes).toUInt().toLong() }
-        val heights = inputs.map { required(it.unknown, 0x12) }
-        val times = inputs.map { required(it.unknown, 0x11) }
-        val maxHeight = heights.filterNotNull().maxOrNull()
-        val maxTime = times.filterNotNull().maxOrNull()
+    private fun computeV2Locktime(inputs: List<ParsedV2Input>, fallbackLocktime: Long?): Either<ParseFailure, Long> {
+        fun required(unknown: List<DataEntry>, keyType: Byte): Either<ParseFailure, Long?> {
+            val entry = unknown.firstOrNull { it.key.size() == 1 && it.key[0] == keyType } ?: return Either.Right(null)
+            if (entry.value.size() != 4) return Either.Left(ParseFailure.InvalidTxInput("required locktime must be 4 bytes"))
+            return Either.Right(Pack.int32LE(entry.value.bytes).toUInt().toLong())
+        }
+        val constrained = ArrayList<Pair<Long?, Long?>>()
+        for (input in inputs) {
+            val height = required(input.unknown, 0x12).getOrElse { return Either.Left(it) }
+            val time = required(input.unknown, 0x11).getOrElse { return Either.Left(it) }
+            if (height != null && height !in 1..499_999_999L) return Either.Left(ParseFailure.InvalidTxInput("PSBT_IN_REQUIRED_HEIGHT_LOCKTIME must be between 1 and 499999999"))
+            if (time != null && time < 500_000_000L) return Either.Left(ParseFailure.InvalidTxInput("PSBT_IN_REQUIRED_TIME_LOCKTIME must be at least 500000000"))
+            if (height != null || time != null) constrained.add(height to time)
+        }
         return when {
-            maxHeight == null && maxTime == null -> fallback
-            maxHeight != null && heights.all { it != null } -> maxHeight
-            maxTime != null && times.all { it != null } -> maxTime
-            maxHeight != null -> maxHeight
-            else -> maxTime ?: fallback
+            constrained.isEmpty() -> Either.Right(fallbackLocktime ?: 0L)
+            constrained.all { it.first != null } -> Either.Right(constrained.maxOf { it.first!! })
+            constrained.all { it.second != null } -> Either.Right(constrained.maxOf { it.second!! })
+            else -> Either.Left(ParseFailure.InvalidTxInput("inputs require incompatible locktime types"))
         }
     }
 

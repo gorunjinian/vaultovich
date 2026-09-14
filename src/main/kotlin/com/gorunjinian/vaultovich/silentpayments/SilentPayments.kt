@@ -7,7 +7,10 @@ import com.gorunjinian.vaultovich.LexicographicalOrdering
 import com.gorunjinian.vaultovich.OutPoint
 import com.gorunjinian.vaultovich.PrivateKey
 import com.gorunjinian.vaultovich.PublicKey
+import com.gorunjinian.vaultovich.Script
+import com.gorunjinian.vaultovich.OP_PUSHDATA
 import com.gorunjinian.vaultovich.XonlyPublicKey
+import com.gorunjinian.vaultovich.silentpayments.SilentPaymentInputs.SpInputKind
 import java.math.BigInteger
 
 /**
@@ -34,7 +37,9 @@ object SilentPayments {
 
     /** Reason a sender-side derivation failed; carried by [SilentPaymentMathException]. */
     enum class FailureReason {
-        NO_ELIGIBLE_INPUTS, NO_RECIPIENTS, PRIVATE_KEY_SUM_ZERO, INVALID_INPUT_HASH, INVALID_TWEAK, GROUP_EXCEEDS_KMAX
+        NO_ELIGIBLE_INPUTS, NO_RECIPIENTS, PRIVATE_KEY_SUM_ZERO, INVALID_INPUT_HASH, INVALID_TWEAK, GROUP_EXCEEDS_KMAX,
+        /** The private key supplied for an input does not reproduce that input's scriptPubKey. */
+        KEY_DOES_NOT_MATCH_INPUT
     }
 
     /**
@@ -44,8 +49,94 @@ object SilentPayments {
      */
     class SilentPaymentMathException(val reason: FailureReason, message: String) : IllegalArgumentException(message)
 
-    /** A spent input whose private key participates in the shared-secret derivation. */
+    /**
+     * A spent input whose private key participates in the shared-secret derivation.
+     *
+     * For a taproot input this must be the private key of the taproot *output* key (BIP-352: "the
+     * sender uses the private key corresponding to the taproot output key (i.e. the tweaked private
+     * key)"), not the BIP-86 internal key. Prefer building these through [eligibleKey], which checks
+     * the key against the script being spent; see [taprootOutputPrivateKey] for the tweak.
+     */
     data class EligibleInputKey(val privateKey: PrivateKey, val isTaproot: Boolean)
+
+    /**
+     * An input the sender is spending: the key we hold for it and the script it pays to, so the
+     * key can be checked against the script and the input classified per BIP-352.
+     *
+     * @param privateKey for P2TR the output-key private key ([taprootOutputPrivateKey]); otherwise the key whose hash the script commits to.
+     * @param redeemScript the P2SH redeem script for P2SH-P2WPKH inputs.
+     * @param witnessStack the witness, if the input is already signed (used to detect NUMS script-path spends).
+     */
+    data class SpentInput(
+        val outPoint: OutPoint,
+        val privateKey: PrivateKey,
+        val scriptPubKey: ByteVector,
+        val redeemScript: ByteVector? = null,
+        val witnessStack: List<ByteVector>? = null,
+    )
+
+    /**
+     * The private key of a BIP-341 taproot *output* key, from the internal key and optional script
+     * tree root: `t = H_TapTweak(P || root)`, `d = k + t` after negating `k` if `P` has odd Y. This
+     * is what BIP-352 requires as the input key of a P2TR input.
+     */
+    fun taprootOutputPrivateKey(internalKey: PrivateKey, merkleRoot: ByteVector32? = null): PrivateKey {
+        val tweak = if (merkleRoot == null) Crypto.TaprootTweak.NoScriptTweak else Crypto.TaprootTweak.ScriptTweak(merkleRoot)
+        return internalKey.tweak(internalKey.xOnlyPublicKey().tweak(tweak))
+    }
+
+    /**
+     * Classify a spent input and check that [SpentInput.privateKey] is the key its script commits to.
+     *
+     * Returns `null` when the input must be left out of the shared-secret sum: a script type BIP-352
+     * does not cover, a taproot script-path spend with the NUMS internal key, or a P2PKH / P2WPKH /
+     * P2SH-P2WPKH input whose key hash was computed over the *uncompressed* encoding, which BIP-352
+     * receivers skip ("only X-only and compressed public keys are permitted").
+     *
+     * @throws SilentPaymentMathException with [FailureReason.KEY_DOES_NOT_MATCH_INPUT] when the key
+     * reproduces neither encoding: a payment derived from it would be unrecoverable by the receiver.
+     */
+    fun eligibleKey(input: SpentInput): EligibleInputKey? {
+        val pub = input.privateKey.publicKey()
+        fun mismatch(kind: String): Nothing = throw SilentPaymentMathException(
+            FailureReason.KEY_DOES_NOT_MATCH_INPUT, "the private key does not match the $kind input being spent"
+        )
+        /** true: compressed key matches; false: only the uncompressed key matches (skip); throws otherwise. */
+        fun compressedKeyMatches(hash: ByteVector, kind: String): Boolean = when {
+            hash == ByteVector(pub.hash160()) -> true
+            hash == ByteVector(Crypto.hash160(pub.toUncompressedBin())) -> false
+            else -> mismatch(kind)
+        }
+        fun push(script: ByteVector, index: Int): ByteVector = (Script.parse(script)[index] as OP_PUSHDATA).data
+
+        return when (SilentPaymentInputs.classify(input.scriptPubKey, input.redeemScript, input.witnessStack)) {
+            SpInputKind.INELIGIBLE -> null
+            SpInputKind.P2TR -> {
+                val outputKey = Script.pay2trOutputKey(input.scriptPubKey) ?: mismatch("P2TR")
+                if (input.privateKey.xOnlyPublicKey() != outputKey) mismatch("P2TR (the output-key private key is required, see taprootOutputPrivateKey)")
+                EligibleInputKey(input.privateKey, isTaproot = true)
+            }
+            SpInputKind.P2WPKH ->
+                if (compressedKeyMatches(push(input.scriptPubKey, 1), "P2WPKH")) EligibleInputKey(input.privateKey, isTaproot = false) else null
+            SpInputKind.P2SH_P2WPKH -> {
+                val redeem = input.redeemScript ?: mismatch("P2SH-P2WPKH")
+                if (ByteVector(Script.write(Script.pay2sh(redeem.toByteArray()))) != input.scriptPubKey) mismatch("P2SH-P2WPKH (redeem script)")
+                if (compressedKeyMatches(push(redeem, 1), "P2SH-P2WPKH")) EligibleInputKey(input.privateKey, isTaproot = false) else null
+            }
+            SpInputKind.P2PKH ->
+                if (compressedKeyMatches(push(input.scriptPubKey, 2), "P2PKH")) EligibleInputKey(input.privateKey, isTaproot = false) else null
+        }
+    }
+
+    /** [eligibleKey] over every input, dropping the ineligible ones. */
+    fun eligibleKeys(inputs: List<SpentInput>): List<EligibleInputKey> = inputs.mapNotNull { eligibleKey(it) }
+
+    /**
+     * The BIP-375 ECDH share for one scan key: `a · B_scan`, the raw point without the
+     * `input_hash` factor (the verifier applies it). Pair it with a BIP-374 proof from
+     * [DleqProof.generate] using the same `a` and `B_scan`.
+     */
+    fun ecdhShare(sumPrivateKey: PrivateKey, scanPubKey: PublicKey): PublicKey = scanPubKey * sumPrivateKey
 
     /** The public scan/spend keys of a single silent-payment recipient. */
     data class RecipientKeys(val scanPubKey: PublicKey, val spendPubKey: PublicKey)
@@ -135,12 +226,23 @@ object SilentPayments {
     }
 
     /**
+     * Sender derivation from the raw inputs: every input is classified and its key checked against
+     * its script ([eligibleKey]); the smallest outpoint is taken over *all* inputs, eligible or not,
+     * as BIP-352 requires.
+     */
+    fun deriveOutputs(inputs: List<SpentInput>, recipients: List<RecipientKeys>): List<DerivedOutput> =
+        deriveOutputs(eligibleKeys(inputs), inputs.map { it.outPoint }, recipients)
+
+    /**
      * All-in-one sender derivation: from the eligible spent keys, the full set of outpoints, and
      * the recipients, produce a taproot output key for every recipient.
      *
-     * Recipients are grouped by scan key (preserving first-seen order, matching drongo), `k`
-     * iterates from 0 within each group, and results are returned tagged with the original
-     * recipient index so the caller can splice each derived output back into the right slot.
+     * Recipients are grouped by scan key (groups in first-seen order). Within a group `k` starts at
+     * 0 and follows BIP-375's rule for PSBTs: "if there are multiple silent payment codes with the
+     * same scan key, sort the codes lexicographically in ascending order to determine the ordering
+     * of the k value", i.e. ascending spend key bytes, with repeated codes kept in output order
+     * (stable sort). Results are tagged with the original recipient index so the caller can splice
+     * each derived output back into the right slot.
      */
     fun deriveOutputs(
         eligibleKeys: List<EligibleInputKey>,
@@ -168,12 +270,23 @@ object SilentPayments {
             )
             val scanPubKey = recipients[indices.first()].scanPubKey
             val secret = sharedSecret(hash, a, scanPubKey)
-            indices.forEachIndexed { k, recipientIndex ->
+            val ordered = indices.sortedWith { i, j -> compareUnsigned(recipients[i].spendPubKey.value, recipients[j].spendPubKey.value) }
+            ordered.forEachIndexed { k, recipientIndex ->
                 val key = outputKey(recipients[recipientIndex].spendPubKey, secret, k)
                 results.add(DerivedOutput(recipientIndex, key))
             }
         }
         return results
+    }
+
+    /** Unsigned lexicographic byte-string comparison (what "lexicographically" means for serialized codes). */
+    private fun compareUnsigned(a: ByteVector, b: ByteVector): Int {
+        val n = minOf(a.size(), b.size())
+        for (i in 0 until n) {
+            val d = (a[i].toInt() and 0xff) - (b[i].toInt() and 0xff)
+            if (d != 0) return d
+        }
+        return a.size() - b.size()
     }
 
     /** Big-endian uint32 serialization (BIP-352 `ser_32`). */

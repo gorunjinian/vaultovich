@@ -6,6 +6,7 @@ import com.gorunjinian.vaultovich.DataEntry
 import com.gorunjinian.vaultovich.Global
 import com.gorunjinian.vaultovich.Input
 import com.gorunjinian.vaultovich.Output
+import com.gorunjinian.vaultovich.Psbt
 import com.gorunjinian.vaultovich.PublicKey
 import com.gorunjinian.vaultovich.byteVector32
 import com.gorunjinian.vaultovich.crypto.Pack
@@ -13,8 +14,10 @@ import com.gorunjinian.vaultovich.crypto.Pack
 /**
  * BIP-374/BIP-375 PSBT field plumbing for silent payments.
  *
- * Field codes and wire formats are pinned to drongo's `PSBT.java` / `PSBTInput.java` /
- * `PSBTOutput.java` so we are wire-compatible with Sparrow.
+ * Field codes are the ones registered in the BIP-174 type registry (BIP-375 defines 0x07/0x08,
+ * 0x1d/0x1e and the output fields 0x09/0x0a; 0x1f/0x20 are registered for receive-spending). Wire
+ * formats match drongo so we are interoperable with Sparrow. BIP-375: every one of these fields
+ * "requires exclusion" in PSBT v0 and is only allowed in v2.
  *
  * The per-output and per-input fields are authored by the watching wallet (Sparrow or
  * equivalent); we consume them, derive/sign, and round-trip them untouched. The **global** ECDH
@@ -37,6 +40,14 @@ object Bip374Fields {
 
     /** `PSBT_GLOBAL_SP_DLEQ`: keyed by `ser_P(B_scan)`, value = 64 bytes — a BIP-374 DLEQ proof. */
     const val PSBT_GLOBAL_SP_DLEQ: Byte = 0x08
+
+    // ---- Per-input fields (BIP-375): one signer's share for the inputs it holds keys for ----
+
+    /** `PSBT_IN_SP_ECDH_SHARE`: keyed by `ser_P(B_scan)`, value = 33 bytes — `ser_P(a_i·B_scan)` for this input's key. */
+    const val PSBT_IN_SP_ECDH_SHARE: Byte = 0x1d
+
+    /** `PSBT_IN_SP_DLEQ`: keyed by `ser_P(B_scan)`, value = 64 bytes — BIP-374 proof over this input's public key. */
+    const val PSBT_IN_SP_DLEQ: Byte = 0x1e
 
     // ---- Per-output fields (consumed by Story A: sending to an SP recipient) ----
 
@@ -96,10 +107,58 @@ object Bip374Fields {
         return DataEntry(ByteVector(byteArrayOf(PSBT_GLOBAL_SP_DLEQ) + scanKey.value.toByteArray()), ByteVector(proof))
     }
 
+    /** Build a `PSBT_IN_SP_ECDH_SHARE` entry for [scanKey]: `0x1d ‖ ser_P(B_scan)` → `ser_P(a_i·B_scan)`. */
+    fun inputEcdhShareEntry(scanKey: PublicKey, ecdhShare: PublicKey): DataEntry =
+        DataEntry(ByteVector(byteArrayOf(PSBT_IN_SP_ECDH_SHARE) + scanKey.value.toByteArray()), ecdhShare.value)
+
+    /** Build a `PSBT_IN_SP_DLEQ` entry for [scanKey]: `0x1e ‖ ser_P(B_scan)` → 64-byte proof. */
+    fun inputDleqProofEntry(scanKey: PublicKey, proof: ByteArray): DataEntry {
+        require(proof.size == DleqProof.PROOF_LENGTH) { "DLEQ proof must be ${DleqProof.PROOF_LENGTH} bytes, got ${proof.size}" }
+        return DataEntry(ByteVector(byteArrayOf(PSBT_IN_SP_DLEQ) + scanKey.value.toByteArray()), ByteVector(proof))
+    }
+
     /** True if [entry] is a global SP ECDH share or DLEQ proof (`0x07`/`0x08` keyed by a scan key). */
     fun isGlobalSilentPaymentProofEntry(entry: DataEntry): Boolean =
         entry.key.size() == 34 && (entry.key[0] == PSBT_GLOBAL_SP_ECDH_SHARE || entry.key[0] == PSBT_GLOBAL_SP_DLEQ)
+
+    /** True if [entry] is any BIP-375 / registry silent-payment global field. */
+    fun isGlobalSilentPaymentEntry(entry: DataEntry): Boolean = isGlobalSilentPaymentProofEntry(entry)
+
+    /** True if [entry] is any silent-payment per-input field (`0x1d`, `0x1e`, `0x1f`, `0x20`). */
+    fun isInputSilentPaymentEntry(entry: DataEntry): Boolean = when (entry.key.size()) {
+        1 -> entry.key[0] == PSBT_IN_SP_TWEAK
+        34 -> entry.key[0] == PSBT_IN_SP_ECDH_SHARE || entry.key[0] == PSBT_IN_SP_DLEQ || entry.key[0] == PSBT_IN_SP_SPEND_BIP32_DERIVATION
+        else -> false
+    }
+
+    /** True if [entry] is a silent-payment per-output field (`0x09`, `0x0a`). */
+    fun isOutputSilentPaymentEntry(entry: DataEntry): Boolean =
+        entry.key.size() == 1 && (entry.key[0] == PSBT_OUT_SP_V0_INFO || entry.key[0] == PSBT_OUT_SP_V0_LABEL)
 }
+
+/** True if this output carries `PSBT_OUT_SP_V0_INFO` (without parsing it). */
+val Output.isSilentPaymentOutput: Boolean
+    get() = unknown.any { it.key.size() == 1 && it.key[0] == Bip374Fields.PSBT_OUT_SP_V0_INFO }
+
+/** True if any output pays a silent-payment recipient, which triggers the BIP-375 signer rules. */
+val Psbt.hasSilentPaymentOutputs: Boolean
+    get() = outputs.any { it.isSilentPaymentOutput }
+
+/** True if any silent-payment field is present anywhere; such a PSBT must be version 2 (BIP-375). */
+val Psbt.hasSilentPaymentFields: Boolean
+    get() = global.unknown.any(Bip374Fields::isGlobalSilentPaymentEntry) ||
+        inputs.any { i -> i.unknown.any(Bip374Fields::isInputSilentPaymentEntry) } ||
+        outputs.any { o -> o.unknown.any(Bip374Fields::isOutputSilentPaymentEntry) }
+
+/** The per-input SP ECDH shares (`PSBT_IN_SP_ECDH_SHARE`), keyed by scan key. */
+val Input.silentPaymentEcdhShares: Map<PublicKey, PublicKey>
+    get() = unknown.filter { it.key.size() == 34 && it.key[0] == Bip374Fields.PSBT_IN_SP_ECDH_SHARE }
+        .associate { PublicKey(it.key.drop(1).toByteArray()) to PublicKey(it.value.toByteArray()) }
+
+/** The per-input SP DLEQ proofs (`PSBT_IN_SP_DLEQ`), keyed by scan key. */
+val Input.silentPaymentDleqProofs: Map<PublicKey, ByteVector>
+    get() = unknown.filter { it.key.size() == 34 && it.key[0] == Bip374Fields.PSBT_IN_SP_DLEQ }
+        .associate { PublicKey(it.key.drop(1).toByteArray()) to it.value }
 
 /** The global SP ECDH shares (`PSBT_GLOBAL_SP_ECDH_SHARE`), keyed by scan key. */
 val Global.silentPaymentEcdhShares: Map<PublicKey, PublicKey>
