@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.gorunjinian"
-version = "0.1.0"
+version = "0.2.0"
 
 kotlin {
     // Built with JDK 21 (see the test-classpath note below) but emitting Java 17
