@@ -64,6 +64,23 @@ class ParserHardeningTest {
     }
 
     @Test
+    fun nonCanonicalVarintsAreRejected() {
+        fun read(hex: String) = runCatching { BtcSerializer.varint(ByteArrayInput(Hex.decode(hex))) }
+        // Smallest value of each width is canonical.
+        assertEquals(0xFCuL, read("fc").getOrThrow())
+        assertEquals(0xFDuL, read("fdfd00").getOrThrow())
+        assertEquals(0x10000uL, read("fe00000100").getOrThrow())
+        assertEquals(0x100000000uL, read("ff0000000001000000").getOrThrow())
+        // A value that fits in a shorter encoding is not: Bitcoin Core's ReadCompactSize rejects these.
+        for (hex in listOf("fd0100", "fdfc00", "feffff0000", "ffffffffff00000000")) {
+            val e = read(hex).exceptionOrNull()
+            assertTrue("expected IllegalArgumentException for $hex, got $e", e is IllegalArgumentException)
+        }
+        // In a PSBT, the failure surfaces as a parse error.
+        assertEquals(ParseFailure.InvalidContent, assertLeft(magic + Hex.decode("fd0100")))
+    }
+
+    @Test
     fun tensOfThousandsOfEntriesDoNotOverflowTheStack() {
         val out = ByteArrayOutput()
         out.write(magic)

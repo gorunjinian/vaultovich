@@ -234,6 +234,30 @@ class CryptoTest {
         assertTrue(Crypto.verifySignatureSchnorr(msg, sig, tweakedXOnly))
     }
 
+    @Test
+    fun malformedDerSignaturesAreRejectedWithoutThrowing() {
+        // An R length byte >= 0x80 was read as a negative number, making isDERSignature index the array out of bounds.
+        assertFalse(Crypto.isDERSignature(Hex.decode("300602800102010101")))
+
+        // Multi-byte lengths announcing ~2^31 or ~2^23 bytes: decodeSignatureLax used to allocate arrays of that size.
+        val zero = ByteVector64(ByteArray(64))
+        for (sig in listOf("300b02847fffffff0102010101", "300a02837fffff0102010101", "30", "", "3006020101020101ff")) {
+            assertEquals(sig, if (sig == "3006020101020101ff") ByteVector64("00".repeat(31) + "01" + "00".repeat(31) + "01") else zero, Crypto.decodeSignatureLax(Hex.decode(sig)))
+        }
+        assertEquals(zero, Crypto.der2compact(Hex.decode("300b02847fffffff0102010101")))
+
+        // The same signature in a BIP-322 proof is an invalid proof, not an OutOfMemoryError.
+        val priv = PrivateKey(ByteVector32("0101010101010101010101010101010101010101010101010101010101010101"))
+        val address = Bitcoin.computeP2WpkhAddress(priv.publicKey(), Block.LivenetGenesisBlock.hash)
+        val proof = Bip322.encodeSimpleSignature(ScriptWitness(listOf(ByteVector("300b02847fffffff010201010201"), priv.publicKey().value)))
+        assertFalse(Bip322.verifySimple(address, "hello", proof, Block.LivenetGenesisBlock.hash))
+
+        // Well-formed signatures still round-trip.
+        val msg = Crypto.sha256(ByteArray(32) { 1 }).byteVector32()
+        val compact = Crypto.sign(msg, priv)
+        assertEquals(compact, Crypto.der2compact(Crypto.compact2der(compact).toByteArray()))
+    }
+
     private fun sha256Hash(b: ByteArray): ByteArray = Crypto.sha256(b)
 
     private inline fun assertThrows(block: () -> Unit) {

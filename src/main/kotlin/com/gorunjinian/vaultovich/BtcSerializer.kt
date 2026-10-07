@@ -101,11 +101,13 @@ abstract class BtcSerializer<T> {
             val first = input.read()
             // `read()` reports end-of-stream as -1, which `toULong()` would turn into 2^64-1.
             require(first >= 0) { "cannot read a varint from an empty stream" }
+            // Non-canonical encodings (a value written on more bytes than needed) are rejected, as in Bitcoin Core's
+            // ReadCompactSize() and bitcoin-kmp #198: otherwise the same data has several valid encodings.
             return when {
                 first < 0xFD -> first.toULong()
-                first == 0xFD -> uint16(input).toULong()
-                first == 0xFE -> uint32(input).toULong()
-                first == 0xFF -> uint64(input)
+                first == 0xFD -> uint16(input).toULong().also { require(it >= 0xFDu) { "non-canonical varint ($it encoded on 3 bytes)" } }
+                first == 0xFE -> uint32(input).toULong().also { require(it >= 0x10000u) { "non-canonical varint ($it encoded on 5 bytes)" } }
+                first == 0xFF -> uint64(input).also { require(it >= 0x100000000uL) { "non-canonical varint ($it encoded on 9 bytes)" } }
                 else -> {
                     throw IllegalArgumentException("invalid first byte $first for varint type")
                 }

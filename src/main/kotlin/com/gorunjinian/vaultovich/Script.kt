@@ -701,7 +701,7 @@ object Script {
 
     class Runner(
         val context: Context,
-        val scriptFlag: Int = ScriptFlags.MANDATORY_SCRIPT_VERIFY_FLAGS,
+        val scriptFlag: Int = ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS,
     ) {
         companion object {
             /**
@@ -722,10 +722,10 @@ object Script {
 
         fun checkSignatureEcdsa(pubKey: ByteArray, sigBytes: ByteArray, scriptCode: ByteArray, signatureVersion: Int): Boolean {
             return when {
-                sigBytes.isEmpty() -> false
                 !Crypto.checkSignatureEncoding(sigBytes, scriptFlag) -> throw RuntimeException("invalid signature encoding")
                 !Crypto.checkPubKeyEncoding(pubKey, scriptFlag, signatureVersion) -> throw RuntimeException("invalid public key encoding")
                 !Crypto.isPubKeyValid(pubKey) -> false // see how this is different from above ?
+                sigBytes.isEmpty() -> false
                 else -> {
                     val sigHashFlags = sigBytes.last().toInt() and 0xff
                     // sig hash is the last byte
@@ -851,25 +851,51 @@ object Script {
         ): List<ByteVector> {
             val stack = inputStack.toMutableList()
             val altstack = mutableListOf<ByteVector>()
-            // conditions is a stack of boolean that is checked by each IF/NOTIF instruction
-            // each time we execute IF/NOTIF, we insert the boolean that is checked by IF/NOTIF into our "conditions" stack
-            // each time we execute ELSE, we flip the head our "conditions" stack
-            // and each time we execute ENDIF we remove the head of our "conditions" stack
-            // if any value in our "conditions" stack is false, it means that we're in an IF branch that is not executed
-            // OP_1 // conditions = []
-            // OP_IF
-            //   OP_CHECKSIG // conditions = [true]
-            //   OP_IF //
-            //     OP_2 // conditions = [false, true] (we assume CHECKSIG failed), this branch will not be executed
-            //   OP_ELSE
-            //     OP_3 // conditions = [true, true]
-            // OP_ELSE
-            //   OP_PUSHDATA("deadbeef") // conditions = [false], this branch will not be executed
-            // OP_ENDIF
-            // OP_CHECKSIG // conditions = []
-            val conditions = mutableListOf<Boolean>()
+            // IF/NOTIF/ELSE/ENDIF condition stack, as in Bitcoin Core's ConditionStack (bitcoin-kmp #196). It acts like a
+            // stack of booleans, one per level of nested IF, telling whether we are in the executed branch of each; but
+            // only its size and the position of its first false value are ever observed, so that is all we store. A real
+            // stack scanned on every opcode made execution quadratic in the nesting depth, which neither the stack size
+            // limit nor (in tapscript) the opcode limit bounds.
+            val noFalse = UInt.MAX_VALUE
+            var conditionsSize = 0u
+            var firstFalsePos = noFalse
+
+            fun conditionsEmpty(): Boolean = conditionsSize == 0u
+
+            fun conditionsAllTrue(): Boolean = firstFalsePos == noFalse
+
+            fun conditionsPushBack(f: Boolean) {
+                // The stack is all true values and a false is added: the first false value is at the current size.
+                if (firstFalsePos == noFalse && !f) firstFalsePos = conditionsSize
+                conditionsSize++
+            }
+
+            fun conditionsPopBack() {
+                require(conditionsSize > 0u)
+                conditionsSize--
+                // Popping off the first false value makes everything true.
+                if (firstFalsePos == conditionsSize) firstFalsePos = noFalse
+            }
+
+            fun conditionsToggleTop() {
+                require(conditionsSize > 0u)
+                when (firstFalsePos) {
+                    // All true values: the first false will be the top.
+                    noFalse -> firstFalsePos = conditionsSize - 1u
+                    // The top is the first false value: toggling it makes everything true.
+                    conditionsSize - 1u -> firstFalsePos = noFalse
+                    // A false value below the top: toggling the top is unobservable.
+                    else -> {}
+                }
+            }
+
             var opCount = 0
-            var scriptCode: List<ScriptElt> = script
+
+            // Position of the first opcode following the last executed OP_CODESEPARATOR: signatures commit to the script
+            // from there on. Tracking the position avoids copying the script each time OP_CODESEPARATOR is executed.
+            var scriptCodeStart = 0
+
+            fun currentScriptCode(): List<ScriptElt> = if (scriptCodeStart == 0) script else script.subList(scriptCodeStart, script.size)
 
             for (currentPos in script.indices) {
                 val op = script[currentPos]
@@ -886,51 +912,51 @@ object Script {
                     op == OP_VERNOTIF -> throw RuntimeException("OP_VERNOTIF is always invalid")
                     op is OP_PUSHDATA && op.data.size() > MAX_SCRIPT_ELEMENT_SIZE -> throw RuntimeException("Push value size limit exceeded")
                     // check whether we are in a non-executed IF branch
-                    op == OP_IF && conditions.any { !it } -> {
-                        conditions.add(0, false)
+                    op == OP_IF && !conditionsAllTrue() -> {
+                        conditionsPushBack(false)
                     }
 
                     op == OP_IF && stack.isEmpty() -> throw RuntimeException("Invalid OP_IF construction")
                     op == OP_IF -> {
                         val stackhead = stack.removeAt(0)
                         when {
-                            stackhead == True && signatureVersion == SigVersion.SIGVERSION_WITNESS_V0 && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_MINIMALIF) != 0 -> conditions.add(0, true)
-                            stackhead == False && signatureVersion == SigVersion.SIGVERSION_WITNESS_V0 && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_MINIMALIF) != 0 -> conditions.add(0, false)
+                            stackhead == True && signatureVersion == SigVersion.SIGVERSION_WITNESS_V0 && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_MINIMALIF) != 0 -> conditionsPushBack(true)
+                            stackhead == False && signatureVersion == SigVersion.SIGVERSION_WITNESS_V0 && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_MINIMALIF) != 0 -> conditionsPushBack(false)
                             signatureVersion == SigVersion.SIGVERSION_WITNESS_V0 && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_MINIMALIF) != 0 -> throw RuntimeException("OP_IF argument must be minimal")
                             signatureVersion == SigVersion.SIGVERSION_TAPSCRIPT && stackhead != True && stackhead != False -> throw RuntimeException("OP_IF argument must be minimal")
-                            castToBoolean(stackhead) -> conditions.add(0, true)
-                            else -> conditions.add(0, false)
+                            castToBoolean(stackhead) -> conditionsPushBack(true)
+                            else -> conditionsPushBack(false)
                         }
                     }
 
-                    op == OP_NOTIF && conditions.any { !it } -> {
-                        conditions.add(0, true)
+                    op == OP_NOTIF && !conditionsAllTrue() -> {
+                        conditionsPushBack(true)
                     }
 
                     op == OP_NOTIF && stack.isEmpty() -> throw RuntimeException("Invalid OP_NOTIF construction")
                     op == OP_NOTIF -> {
                         val stackhead = stack.removeAt(0)
                         when {
-                            stackhead == False && signatureVersion == SigVersion.SIGVERSION_WITNESS_V0 && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_MINIMALIF) != 0 -> conditions.add(0, true)
-                            stackhead == True && signatureVersion == SigVersion.SIGVERSION_WITNESS_V0 && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_MINIMALIF) != 0 -> conditions.add(0, false)
+                            stackhead == False && signatureVersion == SigVersion.SIGVERSION_WITNESS_V0 && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_MINIMALIF) != 0 -> conditionsPushBack(true)
+                            stackhead == True && signatureVersion == SigVersion.SIGVERSION_WITNESS_V0 && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_MINIMALIF) != 0 -> conditionsPushBack(false)
                             signatureVersion == SigVersion.SIGVERSION_WITNESS_V0 && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_MINIMALIF) != 0 -> throw RuntimeException("OP_NOTIF argument must be minimal")
                             signatureVersion == SigVersion.SIGVERSION_TAPSCRIPT && stackhead != True && stackhead != False -> throw RuntimeException("OP_IF argument must be minimal")
-                            castToBoolean(stackhead) -> conditions.add(0, false)
-                            else -> conditions.add(0, true)
+                            castToBoolean(stackhead) -> conditionsPushBack(false)
+                            else -> conditionsPushBack(true)
                         }
                     }
 
-                    op == OP_ELSE && conditions.isEmpty() -> throw RuntimeException("Invalid OP_ELSE construction")
+                    op == OP_ELSE && conditionsEmpty() -> throw RuntimeException("Invalid OP_ELSE construction")
                     op == OP_ELSE -> {
-                        conditions[0] = !conditions[0]
+                        conditionsToggleTop()
                     }
 
-                    op == OP_ENDIF && conditions.isEmpty() -> throw RuntimeException("Invalid OP_ENDIF construction")
+                    op == OP_ENDIF && conditionsEmpty() -> throw RuntimeException("Invalid OP_ENDIF construction")
                     op == OP_ENDIF -> {
-                        conditions.removeAt(0)
+                        conditionsPopBack()
                     }
 
-                    conditions.any { !it } -> {} // do nothing, we're in an IF branch that is not executed
+                    !conditionsAllTrue() -> {} // do nothing, we're in an IF branch that is not executed
 
                     // and now, things that are checked only in an executed IF branch
                     op == OP_0 -> stack.add(0, False)
@@ -979,8 +1005,9 @@ object Script {
                         stack.add(0, encodeNumber(result))
                     }
 
-                    op == OP_CHECKLOCKTIMEVERIFY && ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY) != 0) && stack.isEmpty() -> throw RuntimeException("cannot run OP_CHECKLOCKTIMEVERIFY on an empty stack")
-                    op == OP_CHECKLOCKTIMEVERIFY && ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY) != 0) -> {
+                    op == OP_CHECKLOCKTIMEVERIFY && ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY) == 0) -> {} // not enabled; treat as a NOP2
+                    op == OP_CHECKLOCKTIMEVERIFY -> {
+                        require(stack.isNotEmpty()) { "cannot run OP_CHECKLOCKTIMEVERIFY on an empty stack" }
                         // Note that elsewhere numeric opcodes are limited to
                         // operands in the range -2**31+1 to 2**31-1, however it is
                         // legal for opcodes to produce results exceeding that
@@ -1000,11 +1027,9 @@ object Script {
                         if (!checkLockTime(locktime, context.tx, context.inputIndex)) throw RuntimeException("unsatisfied CLTV lock time")
                     }
 
-                    op == OP_CHECKLOCKTIMEVERIFY && ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS) != 0) -> throw RuntimeException("use of upgradable NOP is discouraged")
-                    op == OP_CHECKLOCKTIMEVERIFY -> {}
-
-                    op == OP_CHECKSEQUENCEVERIFY && ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_CHECKSEQUENCEVERIFY) != 0) && stack.isEmpty() -> throw RuntimeException("cannot run OP_CHECKSEQUENCEVERIFY on an empty stack")
-                    op == OP_CHECKSEQUENCEVERIFY && ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_CHECKSEQUENCEVERIFY) != 0) -> {
+                    op == OP_CHECKSEQUENCEVERIFY && ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_CHECKSEQUENCEVERIFY) == 0) -> {} // not enabled; treat as a NOP3
+                    op == OP_CHECKSEQUENCEVERIFY -> {
+                        require(stack.isNotEmpty()) { "cannot run OP_CHECKSEQUENCEVERIFY on an empty stack" }
                         // nSequence, like nLockTime, is a 32-bit unsigned integer
                         // field. See the comment in CHECKLOCKTIMEVERIFY regarding
                         // 5-byte numeric operands.
@@ -1023,24 +1048,25 @@ object Script {
                         }
                     }
 
-                    op == OP_CHECKSEQUENCEVERIFY && ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS) != 0) -> throw RuntimeException("use of upgradable NOP is discouraged")
-                    op == OP_CHECKSEQUENCEVERIFY -> {}
-
                     op == OP_CHECKSIG && stack.size < 2 -> throw RuntimeException("Cannot perform OP_CHECKSIG on a stack with less than 2 elements")
                     op == OP_CHECKSIG || op == OP_CHECKSIGVERIFY -> {
                         val pubKey = stack.removeAt(0)
                         val sigBytes = stack.removeAt(0)
-                        // remove signature from script
-                        val scriptCode1 = if (signatureVersion == SigVersion.SIGVERSION_BASE) {
-                            val scriptCode1 = removeSignature(scriptCode, sigBytes)
-                            if (scriptCode1.size != scriptCode.size && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_CONST_SCRIPTCODE) != 0) {
-                                throw RuntimeException("Signature is found in scriptCode")
+                        // remove signature from script; tapscript signatures don't commit to a script code
+                        val scriptCode1 = when (signatureVersion) {
+                            SigVersion.SIGVERSION_BASE -> {
+                                val scriptCode = currentScriptCode()
+                                val scriptCode1 = removeSignature(scriptCode, sigBytes)
+                                if (scriptCode1.size != scriptCode.size && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_CONST_SCRIPTCODE) != 0) {
+                                    throw RuntimeException("Signature is found in scriptCode")
+                                }
+                                write(scriptCode1)
                             }
-                            scriptCode1
-                        } else {
-                            scriptCode
+
+                            SigVersion.SIGVERSION_WITNESS_V0 -> write(currentScriptCode())
+                            else -> ByteArray(0)
                         }
-                        val success = checkSignature(pubKey.toByteArray(), sigBytes.toByteArray(), write(scriptCode1), signatureVersion)
+                        val success = checkSignature(pubKey.toByteArray(), sigBytes.toByteArray(), scriptCode1, signatureVersion)
                         if (!success && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_NULLFAIL) != 0) {
                             require(sigBytes.isEmpty()) { "Signature must be zero for failed CHECKSIG operation" }
                         }
@@ -1058,7 +1084,7 @@ object Script {
                         val pubKey = stack.removeAt(0)
                         val num = decodeNumber(stack.removeAt(0))
                         val sigBytes = stack.removeAt(0)
-                        val success = checkSignature(pubKey.toByteArray(), sigBytes.toByteArray(), write(scriptCode), signatureVersion)
+                        val success = checkSignature(pubKey.toByteArray(), sigBytes.toByteArray(), ByteArray(0), signatureVersion)
                         stack.add(0, encodeNumber(num + (if (success) 1 else 0)))
                     }
 
@@ -1081,6 +1107,7 @@ object Script {
                         stack.removeAt(0)
 
                         // Drop the signature in pre-segwit scripts but not segwit scripts
+                        val scriptCode = currentScriptCode()
                         val scriptCode1 = if (signatureVersion == SigVersion.SIGVERSION_BASE) {
                             val scriptCode1 = removeSignatures(scriptCode, sigs)
                             if (scriptCode1.size != scriptCode.size && (scriptFlag and ScriptFlags.SCRIPT_VERIFY_CONST_SCRIPTCODE) != 0) {
@@ -1103,7 +1130,7 @@ object Script {
 
                     op == OP_CODESEPARATOR -> {
                         this.context.executionData = this.context.executionData.copy(codeSeparatorPos = currentPos.toLong())
-                        scriptCode = script.drop(currentPos + 1)
+                        scriptCodeStart = currentPos + 1
                     }
 
                     op == OP_DEPTH -> {
@@ -1394,7 +1421,7 @@ object Script {
 
                 require(stack.size + altstack.size <= MAX_STACK_SIZE) { "stack is too large: stack size = ${stack.size} alt stack size = ${altstack.size}" }
             }
-            require(conditions.isEmpty()) { "IF/ENDIF imbalance" }
+            require(conditionsEmpty()) { "IF/ENDIF imbalance" }
             return stack
         }
 
@@ -1419,6 +1446,7 @@ object Script {
 
                 witnessVersion == 0L && program.size == WITNESS_V0_SCRIPTHASH_SIZE -> {
                     // P2WPSH, program is the hash of the script, and witness is the stack + the script
+                    require(witness.stack.isNotEmpty()) { "Witness program was passed an empty witness" }
                     val check = Crypto.sha256(witness.stack.last())
                     require(check.contentEquals(program)) { "witness program mismatch" }
                     val finalStack = run(witness.stack.last(), witness.stack.dropLast(1).reversed(), SigVersion.SIGVERSION_WITNESS_V0)
@@ -1498,7 +1526,7 @@ object Script {
                     }
                 }
                 // Standard P2A script (see github.com/bitcoin/bitcoin/pull/30352).
-                witnessVersion == 1L && program.contentEquals(byteArrayOf(0x4e, 0x73)) -> require(witness == witnessPay2anchor) { "P2A output must be spent with an empty witness" }
+                !isP2sh && witnessVersion == 1L && program.contentEquals(byteArrayOf(0x4e, 0x73)) -> {}
                 (scriptFlag and ScriptFlags.SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) != 0 -> throw IllegalArgumentException("Witness version $witnessVersion reserved for soft-fork upgrades")
                 // Higher version witness scripts return true for future softfork compatibility
                 else -> {}
@@ -1525,51 +1553,38 @@ object Script {
          * @return true if the scripts were successfully verified
          */
         fun verifyScripts(scriptSig: ByteArray, scriptPubKey: ByteArray, witness: ScriptWitness): Boolean {
-            fun checkStack(stack: List<ByteVector>): Boolean = when {
-                stack.isEmpty() -> false
-                !castToBoolean(stack.first()) -> false
-                (scriptFlag and ScriptFlags.SCRIPT_VERIFY_CLEANSTACK) != 0 -> {
-                    if ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_P2SH) == 0) throw RuntimeException("illegal script flag")
-                    stack.size == 1
+            // A witness program is any valid script that consists of a 1-byte push opcode followed by a direct data push
+            // of 2 to 40 bytes, as in Bitcoin Core's CScript::IsWitnessProgram().
+            fun isWitnessProgram(script: ByteArray): Pair<Int, ByteArray>? = when {
+                script.size !in 4..42 -> null
+                script[0].toInt() != OP_0.code && (script[0].toInt() < OP_1.code || script[0].toInt() > OP_16.code) -> null
+                script[1].toInt() + 2 == script.size -> {
+                    val version = when (script[0].toInt()) {
+                        OP_0.code -> 0
+                        else -> script[0].toInt() - 0x50
+                    }
+                    version to script.copyOfRange(2, script.size)
                 }
 
-                else -> true
+                else -> null
             }
 
-
-            if ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_WITNESS) != 0) {
-                // We can't check for correct unexpected witness data if P2SH was off, so require
-                // that WITNESS implies P2SH. Otherwise, going from WITNESS->P2SH+WITNESS would be
-                // possible, which is not a softfork.
-                require((scriptFlag and ScriptFlags.SCRIPT_VERIFY_P2SH) != 0)
-            }
             val ssig = parse(scriptSig)
             if (((scriptFlag and ScriptFlags.SCRIPT_VERIFY_SIGPUSHONLY) != 0) && !isPushOnly(ssig)) throw RuntimeException("signature script is not PUSH-only")
-            val stack = run(scriptSig, listOf(), signatureVersion = 0)
-
-            val spub = parse(scriptPubKey)
-            val stack0 = run(scriptPubKey, stack, signatureVersion = 0)
+            val stack = run(scriptSig, listOf(), signatureVersion = SigVersion.SIGVERSION_BASE)
+            val stack0 = run(scriptPubKey, stack, signatureVersion = SigVersion.SIGVERSION_BASE)
             require(stack0.isNotEmpty()) { "Script verification failed, stack should not be empty" }
             require(castToBoolean(stack0.first())) { "Script verification failed, stack starts with 'false'" }
 
             var hadWitness = false
 
-            fun isWitnessProgram(script: List<ScriptElt>): Boolean =
-                script.size == 2 && isSimpleValue(script[0]) && simpleValue(script[0]).toInt() in 0..16 && script[1] is OP_PUSHDATA
-
-            val stack1 = if ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_WITNESS) != 0 && isWitnessProgram(spub)) {
-                val witnessVersion = simpleValue(spub[0])
-                val program = spub[1] as OP_PUSHDATA
-                when {
-                    OP_PUSHDATA.isMinimal(program.data.toByteArray(), program.code) && program.data.size() in 2..40 -> {
-                        hadWitness = true
-                        require(ssig.isEmpty()) { "Malleated segwit script" }
-                        verifyWitnessProgram(witness, witnessVersion.toLong(), program.data.toByteArray(), isP2sh = false)
-                        stack0.take(1)
-                    }
-
-                    else -> stack0
-                }
+            val stack1 = if ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_WITNESS) != 0) {
+                isWitnessProgram(scriptPubKey)?.let { (witnessVersion, witnessProgram) ->
+                    hadWitness = true
+                    require(ssig.isEmpty()) { "Malleated segwit script" }
+                    verifyWitnessProgram(witness, witnessVersion.toLong(), witnessProgram, isP2sh = false)
+                    stack0.take(1)
+                } ?: stack0
             } else stack0
 
             val stack2 = if (((scriptFlag and ScriptFlags.SCRIPT_VERIFY_P2SH) != 0) && isPayToScript(scriptPubKey)) {
@@ -1582,29 +1597,34 @@ object Script {
                 // if we got here after running script pubkey, it means that hash == HASH160(serialized script)
                 // and stack would be serialized_script :: sigN :: ... :: sig1 :: Nil
                 // we pop the first element of the stack, deserialize it and run it against the rest of the stack
-                val stackp2sh = run(stack.first(), stack.tail(), 0)
+                val stackp2sh = run(stack.first(), stack.tail(), SigVersion.SIGVERSION_BASE)
                 require(stackp2sh.isNotEmpty()) { "Script verification failed, stack should not be empty" }
                 require(castToBoolean(stackp2sh.first())) { "Script verification failed, stack starts with 'false'" }
 
                 if ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_WITNESS) != 0) {
-                    val program = parse(stack.first())
-                    when {
-                        program.size == 2 && isSimpleValue(program[0]) && pushSize(program[1]) in 2..40 -> {
-                            hadWitness = true
-                            val witnessVersion = simpleValue(program[0])
-                            verifyWitnessProgram(witness, witnessVersion.toLong(), (program[1] as OP_PUSHDATA).data.toByteArray(), isP2sh = true)
-                            stackp2sh.take(1)
-                        }
-
-                        else -> stackp2sh
-                    }
+                    isWitnessProgram(stack.first().toByteArray())?.let { (witnessVersion, witnessProgram) ->
+                        hadWitness = true
+                        // The scriptSig must be _exactly_ a single push of the redeemScript. Otherwise we reintroduce malleability.
+                        require(ssig.size == 1 && ssig.first() == OP_PUSHDATA(stack.first())) { "Witness requires only-redeemscript scriptSig" }
+                        verifyWitnessProgram(witness, witnessVersion.toLong(), witnessProgram, isP2sh = true)
+                        stackp2sh.take(1)
+                    } ?: stackp2sh
                 } else stackp2sh
             } else stack1
 
-            if ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_WITNESS) != 0 && !hadWitness) {
-                require(witness.isNull())
+            if ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_CLEANSTACK) != 0) {
+                require((scriptFlag and ScriptFlags.SCRIPT_VERIFY_P2SH) != 0) { "illegal script flag" }
+                require((scriptFlag and ScriptFlags.SCRIPT_VERIFY_WITNESS) != 0) { "illegal script flag" }
+                if (stack2.size != 1) {
+                    return false
+                }
             }
-            return checkStack(stack2)
+
+            if ((scriptFlag and ScriptFlags.SCRIPT_VERIFY_WITNESS) != 0) {
+                require((scriptFlag and ScriptFlags.SCRIPT_VERIFY_P2SH) != 0) { "illegal script flag" }
+                if (!hadWitness) require(witness.isNull())
+            }
+            return true
         }
     }
 }
