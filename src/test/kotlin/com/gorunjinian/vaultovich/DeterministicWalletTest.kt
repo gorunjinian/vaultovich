@@ -206,6 +206,20 @@ class DeterministicWalletTest {
     }
 
     @Test
+    fun rejectExtendedKeysThatAreNot78BytesLong() {
+        val m = generate(ByteVector("000102030405060708090a0b0c0d0e0f"))
+        val xprv = Base58Check.decodeWithIntPrefix(m.encode(testnet = false)).second
+        val xpub = Base58Check.decodeWithIntPrefix(m.extendedPublicKey.encode(testnet = false)).second
+        // A truncated xprv used to decode into a different but valid key, its last byte zero-filled.
+        for (bin in listOf(xprv.copyOf(xprv.size - 1), xprv + byteArrayOf(0))) {
+            assertThrows { DeterministicWallet.ExtendedPrivateKey.decode(Base58Check.encode(DeterministicWallet.xprv, bin)) }
+        }
+        for (bin in listOf(xpub.copyOf(xpub.size - 1), xpub + byteArrayOf(0))) {
+            assertThrows { DeterministicWallet.ExtendedPublicKey.decode(Base58Check.encode(DeterministicWallet.xpub, bin)) }
+        }
+    }
+
+    @Test
     fun recoverParentPrivateKeyFromMasterPubAndChildPriv() {
         val m = generate(ByteVector("000102030405060708090a0b0c0d0e0f"))
         val masterPriv = PrivateKey(m.secretkeybytes)

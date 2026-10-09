@@ -392,28 +392,26 @@ data object OP_XOR : ScriptElt() {
 
     companion object {
         @JvmStatic
-         fun codeFromDataLength(length: Int): Int {
-            val code = when {
-                length < 0x4c -> length
-                length < 0xff -> 0x4c
-                length < 0xffff -> 0x4d
-                else -> 0x4e
-            }
-            return code
+         fun codeFromDataLength(size: Int): Int = when {
+            // OP_PUSHDATA1 and OP_PUSHDATA2 cover lengths up to 0xff and 0xffff inclusive (bitcoin-kmp #191).
+            size < OP_PUSHDATA1.code -> size
+            size <= 0xff -> OP_PUSHDATA1.code
+            size <= 0xffff -> OP_PUSHDATA2.code
+            else -> OP_PUSHDATA4.code
         }
 
         @JvmStatic
          fun isMinimal(data: ByteArray, code: Int): Boolean {
+            require(code >= 0 && code <= OP_PUSHDATA4.code)
             return when {
                 data.isEmpty() -> code == OP_0.code
-                data.size == 1 && data[0] >= 1 && data[0] <= 16 -> code == (OP_1.code).plus(data[0] - 1)
-                data.size == 1 && data[0] == 0x81.toByte() -> code == OP_1NEGATE.code
+                // These must be pushed with OP_1..OP_16 and OP_1NEGATE, which are not OP_PUSHDATA elements.
+                data.size == 1 && data[0] >= 1 && data[0] <= 16 -> false
+                data.size == 1 && data[0] == 0x81.toByte() -> false
                 data.size <= 75 -> code == data.size
                 data.size <= 255 -> code == OP_PUSHDATA1.code
                 data.size <= 65535 -> code == OP_PUSHDATA2.code
-                else -> {
-                    true
-                }
+                else -> true
             }
         }
     }

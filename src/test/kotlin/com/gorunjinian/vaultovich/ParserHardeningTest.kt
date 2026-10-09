@@ -64,6 +64,36 @@ class ParserHardeningTest {
     }
 
     @Test
+    fun nonCanonicalVarintsAreRejected() {
+        fun read(hex: String) = runCatching { BtcSerializer.varint(ByteArrayInput(Hex.decode(hex))) }
+        // Smallest value of each width is canonical.
+        assertEquals(0xFCuL, read("fc").getOrThrow())
+        assertEquals(0xFDuL, read("fdfd00").getOrThrow())
+        assertEquals(0x10000uL, read("fe00000100").getOrThrow())
+        assertEquals(0x100000000uL, read("ff0000000001000000").getOrThrow())
+        // A value that fits in a shorter encoding is not: Bitcoin Core's ReadCompactSize rejects these.
+        for (hex in listOf("fd0100", "fdfc00", "feffff0000", "ffffffffff00000000")) {
+            val e = read(hex).exceptionOrNull()
+            assertTrue("expected IllegalArgumentException for $hex, got $e", e is IllegalArgumentException)
+        }
+        // In a PSBT, the failure surfaces as a parse error.
+        assertEquals(ParseFailure.InvalidContent, assertLeft(magic + Hex.decode("fd0100")))
+    }
+
+    @Test
+    fun psbtV2CountsLargerThanTheRemainingBytesAreRejected() {
+        // PSBT_GLOBAL_INPUT_COUNT / OUTPUT_COUNT were narrowed to Int unchecked: 0x7fffffff pre-sized a list of 2^31
+        // entries, whose OutOfMemoryError escaped Psbt.read, and 2^32 + 1 wrapped to 1.
+        fun v2(inputCount: String, outputCount: String) = magic +
+            entry(byteArrayOf(0x02), Hex.decode("02000000")) + entry(byteArrayOf(0x04), Hex.decode(inputCount)) +
+            entry(byteArrayOf(0x05), Hex.decode(outputCount)) + entry(byteArrayOf(0xfb.toByte()), Hex.decode("02000000")) + separator
+        for (count in listOf("feffffff7f", "fef0ffff7f", "ff0100000001000000")) {
+            assertEquals(ParseFailure.InvalidGlobalTx("invalid input count"), assertLeft(v2(count, "00")))
+            assertEquals(ParseFailure.InvalidGlobalTx("invalid output count"), assertLeft(v2("00", count)))
+        }
+    }
+
+    @Test
     fun tensOfThousandsOfEntriesDoNotOverflowTheStack() {
         val out = ByteArrayOutput()
         out.write(magic)

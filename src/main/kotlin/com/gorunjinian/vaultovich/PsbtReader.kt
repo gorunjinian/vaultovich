@@ -375,14 +375,18 @@ val globalKeyTypes = setOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xfb.toByte())
             }
         }
 
+        // Every input and output map takes at least its 0x00 separator byte, so a count above the remaining bytes is
+        // bogus. Checking before narrowing to Int stops a count of 2^32 or more from wrapping to a small one, and a
+        // count near 2^31 from pre-sizing a list whose OutOfMemoryError would escape the Either API.
+        fun readCount(entry: DataEntry): Int? = runCatching { BtcSerializer.varint(ByteArrayInput(entry.value.toByteArray())) }
+            .getOrNull()?.takeIf { it <= input.availableBytes.toULong() }?.toInt()
+
         val inputCount = knownGlobal.find { it.key[0] == 0x04.toByte() }?.let {
-            runCatching { BtcSerializer.varint(ByteArrayInput(it.value.toByteArray())).toInt() }
-                .getOrElse { return Either.Left(ParseFailure.InvalidGlobalTx("invalid input count")) }
+            readCount(it) ?: return Either.Left(ParseFailure.InvalidGlobalTx("invalid input count"))
         } ?: return Either.Left(ParseFailure.InvalidGlobalTx("PSBT_GLOBAL_INPUT_COUNT is required in PSBTv2"))
 
         val outputCount = knownGlobal.find { it.key[0] == 0x05.toByte() }?.let {
-            runCatching { BtcSerializer.varint(ByteArrayInput(it.value.toByteArray())).toInt() }
-                .getOrElse { return Either.Left(ParseFailure.InvalidGlobalTx("invalid output count")) }
+            readCount(it) ?: return Either.Left(ParseFailure.InvalidGlobalTx("invalid output count"))
         } ?: return Either.Left(ParseFailure.InvalidGlobalTx("PSBT_GLOBAL_OUTPUT_COUNT is required in PSBTv2"))
 
         val txModifiable = knownGlobal.find { it.key[0] == 0x06.toByte() }?.let {

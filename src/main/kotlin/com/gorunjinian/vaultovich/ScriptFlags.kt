@@ -100,16 +100,21 @@ package com.gorunjinian.vaultovich
     // Making unknown  key versions (in BIP 342 scripts) non-standard
      const val SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE: Int = (1 shl 20)
 
+    /** Every flag defined above set. */
+     const val MAX_SCRIPT_VERIFY_FLAGS: Int = (1 shl 21) - 1
+
     /**
      * Mandatory script verification flags that all new blocks must comply with for
-     * them to be valid. (but old blocks may not comply with) Currently just P2SH,
-     * but in the future other flags may be added, such as a soft-fork to enforce
-     * strict DER encoding.
-     *
-     * Failing one of these tests may trigger a DoS ban - see CheckInputs() for
-     * details.
+     * them to be valid (but old blocks may not comply with): the consensus rules, as
+     * in Bitcoin Core.
      */
-     const val MANDATORY_SCRIPT_VERIFY_FLAGS: Int = SCRIPT_VERIFY_P2SH
+     const val MANDATORY_SCRIPT_VERIFY_FLAGS: Int = SCRIPT_VERIFY_P2SH or
+            SCRIPT_VERIFY_DERSIG or
+            SCRIPT_VERIFY_NULLDUMMY or
+            SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY or
+            SCRIPT_VERIFY_CHECKSEQUENCEVERIFY or
+            SCRIPT_VERIFY_WITNESS or
+            SCRIPT_VERIFY_TAPROOT
 
     /**
      * Standard script verification flags that standard transactions will comply
@@ -117,22 +122,16 @@ package com.gorunjinian.vaultovich
      * blocks and we must accept those blocks.
      */
      const val STANDARD_SCRIPT_VERIFY_FLAGS: Int = MANDATORY_SCRIPT_VERIFY_FLAGS or
-            SCRIPT_VERIFY_DERSIG or
             SCRIPT_VERIFY_STRICTENC or
             SCRIPT_VERIFY_MINIMALDATA or
-            SCRIPT_VERIFY_NULLDUMMY or
             SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS or
             SCRIPT_VERIFY_CLEANSTACK or
             SCRIPT_VERIFY_MINIMALIF or
             SCRIPT_VERIFY_NULLFAIL or
-            SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY or
-            SCRIPT_VERIFY_CHECKSEQUENCEVERIFY or
             SCRIPT_VERIFY_LOW_S or
-            SCRIPT_VERIFY_WITNESS or
             SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM or
             SCRIPT_VERIFY_WITNESS_PUBKEYTYPE or
             SCRIPT_VERIFY_CONST_SCRIPTCODE or
-            SCRIPT_VERIFY_TAPROOT or
             SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION or
             SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS or
             SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE
